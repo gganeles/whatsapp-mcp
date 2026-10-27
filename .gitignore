@@ -31,3 +31,10 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# whatsapp-mcp
+/whatsapp-mcp
+*.db
+*.db-shm
+*.db-wal
+.whatsapp-mcp/
