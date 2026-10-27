@@ -25,10 +25,12 @@ import (
 
 // WhatsApp wraps a whatsmeow client and mirrors everything it receives into the MessageStore.
 type WhatsApp struct {
-	Client  *whatsmeow.Client
-	Store   *MessageStore
-	DataDir string
-	log     waLog.Logger
+	Client   *whatsmeow.Client
+	Store    *MessageStore
+	DataDir  string
+	FilesDir string // the only folder file tools may read from or write to
+	Phone    string // the account's number; pairing with any other number is rejected
+	log      waLog.Logger
 
 	mu        sync.Mutex
 	pairCode  string // phone pairing code while pairing, empty otherwise
@@ -42,16 +44,22 @@ type WhatsApp struct {
 	groupNames map[types.JID]string // known group names; "" means a lookup is pending or failed
 }
 
-func NewWhatsApp(ctx context.Context, dataDir string, log waLog.Logger) (*WhatsApp, error) {
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+var setDeviceProps sync.Once
+
+// NewWhatsApp opens the account stored in dataDir. phone is the account's number (digits only).
+func NewWhatsApp(ctx context.Context, dataDir, phone string, log waLog.Logger) (*WhatsApp, error) {
+	filesDir := filepath.Join(dataDir, "files")
+	if err := os.MkdirAll(filesDir, 0o700); err != nil {
 		return nil, err
 	}
-	// Ask for as much history as the phone is willing to share when pairing.
-	store.DeviceProps.RequireFullSync = proto.Bool(true)
-	store.DeviceProps.HistorySyncConfig.FullSyncDaysLimit = proto.Uint32(3650)
-	store.DeviceProps.HistorySyncConfig.FullSyncSizeMbLimit = proto.Uint32(10240)
-	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
-	store.SetOSInfo("WhatsApp MCP", [3]uint32{0, 1, 0})
+	setDeviceProps.Do(func() {
+		// Ask for as much history as the phone is willing to share when pairing.
+		store.DeviceProps.RequireFullSync = proto.Bool(true)
+		store.DeviceProps.HistorySyncConfig.FullSyncDaysLimit = proto.Uint32(3650)
+		store.DeviceProps.HistorySyncConfig.FullSyncSizeMbLimit = proto.Uint32(10240)
+		store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
+		store.SetOSInfo("WhatsApp MCP", [3]uint32{0, 1, 0})
+	})
 
 	sessionDB := filepath.Join(dataDir, "whatsapp.db")
 	container, err := sqlstore.New(ctx, "sqlite", sqliteDSN(sessionDB), log.Sub("Database"))
@@ -68,20 +76,18 @@ func NewWhatsApp(ctx context.Context, dataDir string, log waLog.Logger) (*WhatsA
 		return nil, fmt.Errorf("failed to open message database: %w", err)
 	}
 	wa := &WhatsApp{
-		Client:  whatsmeow.NewClient(device, log.Sub("Client")),
-		Store:   msgStore,
-		DataDir: dataDir,
-		qrPath:  filepath.Join(dataDir, "login-qr.png"),
-		log:     log,
+		Client:   whatsmeow.NewClient(device, log.Sub("Client")),
+		Store:    msgStore,
+		DataDir:  dataDir,
+		FilesDir: filesDir,
+		Phone:    phone,
+		qrPath:   filepath.Join(dataDir, "login-qr.png"),
+		log:      log,
 
 		groupNames: make(map[types.JID]string),
 	}
 	wa.Client.AddEventHandler(wa.handleEvent)
 	return wa, nil
-}
-
-func (wa *WhatsApp) LoggedIn() bool {
-	return wa.Client.Store.ID != nil
 }
 
 // Connect connects to WhatsApp using the stored session. It fails if the device isn't paired yet.
@@ -175,7 +181,14 @@ func (wa *WhatsApp) consumeQR(qrChan <-chan whatsmeow.QRChannelItem, ready chan 
 		case whatsmeow.QRChannelSuccess.Event:
 			wa.qrCode, wa.pairCode = "", ""
 			_ = os.Remove(wa.qrPath)
-			wa.log.Infof("Pairing successful")
+			if id := wa.Client.Store.ID; id != nil && wa.Phone != "" && id.User != wa.Phone {
+				// Someone linked a different WhatsApp account than this one belongs to.
+				wa.pairErr = fmt.Errorf("the phone that was linked is +%s, but this account is +%s; it has been unlinked", id.User, wa.Phone)
+				wa.log.Warnf("%v", wa.pairErr)
+				go wa.unlinkWrongNumber()
+			} else {
+				wa.log.Infof("Pairing successful")
+			}
 		default:
 			wa.qrCode, wa.pairCode = "", ""
 			_ = os.Remove(wa.qrPath)
@@ -198,6 +211,23 @@ func (wa *WhatsApp) consumeQR(qrChan <-chan whatsmeow.QRChannelItem, ready chan 
 	wa.mu.Lock()
 	wa.pairing = false
 	wa.mu.Unlock()
+}
+
+// unlinkWrongNumber removes a device that was paired with a number other than the account's.
+func (wa *WhatsApp) unlinkWrongNumber() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for !wa.Client.IsLoggedIn() && ctx.Err() == nil {
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err := wa.Client.Logout(ctx); err != nil {
+		wa.Client.Disconnect()
+		_ = wa.Client.Store.Delete(ctx)
+	}
+}
+
+func (wa *WhatsApp) LoggedIn() bool {
+	return wa.Client.Store.ID != nil && (wa.Phone == "" || wa.Client.Store.ID.User == wa.Phone)
 }
 
 func (wa *WhatsApp) waitPairingDone(timeout time.Duration) {

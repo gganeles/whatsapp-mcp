@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -18,7 +17,10 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-const testPassword = "correct horse battery"
+const (
+	testPassword = "correct horse battery"
+	testPhone    = "14155550001"
+)
 
 type oauthTest struct {
 	t      *testing.T
@@ -33,22 +35,52 @@ func newOAuthTest(t *testing.T) *oauthTest {
 	s.AddTool(mcp.NewTool("ping"), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return mcp.NewToolResultText("pong"), nil
 	})
-	hash, err := HashPassword(testPassword)
+	store, err := OpenAccountStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err = store.AddAccount(context.Background(), testPhone, testPassword); err != nil {
+		t.Fatal(err)
+	}
+	return newOAuthTestWith(t, store, s)
+}
+
+func newOAuthTestWith(t *testing.T, store *AccountStore, s *server.MCPServer) *oauthTest {
+	t.Helper()
 	ot := &oauthTest{t: t}
 	var handler http.Handler
 	ot.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, r) }))
 	t.Cleanup(ot.srv.Close)
-	ot.auth, err = NewAuthServer(filepath.Join(t.TempDir(), "auth.db"), ot.srv.URL, hash, defaultRedirects)
+	var err error
+	ot.auth, err = NewAuthServer(store, ot.srv.URL, defaultRedirects)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = ot.auth.Close() })
 	handler = NewHTTPHandler(s, ot.auth, ot.srv.URL, nil)
 	ot.client = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	return ot
+}
+
+// signIn runs the whole OAuth flow for an account and returns its access token.
+func (ot *oauthTest) signIn(phone, password string) string {
+	ot.t.Helper()
+	_, client := ot.register(claudeRedirect)
+	clientID := client["client_id"].(string)
+	verifier, challenge := pkce()
+	resp := ot.authorizeAs(phone, clientID, claudeRedirect, challenge, password)
+	if resp.StatusCode != http.StatusFound {
+		ot.t.Fatalf("sign-in as %s failed: %d", phone, resp.StatusCode)
+	}
+	loc, _ := url.Parse(resp.Header.Get("Location"))
+	resp, body := ot.postForm("/token", url.Values{"grant_type": {"authorization_code"}, "code": {loc.Query().Get("code")},
+		"client_id": {clientID}, "redirect_uri": {claudeRedirect}, "code_verifier": {verifier}})
+	if resp.StatusCode != 200 {
+		ot.t.Fatalf("token exchange failed: %s", body)
+	}
+	var tokens map[string]any
+	_ = json.Unmarshal([]byte(body), &tokens)
+	return tokens["access_token"].(string)
 }
 
 func (ot *oauthTest) do(method, path string, body io.Reader, contentType string, headers ...string) (*http.Response, string) {
@@ -85,6 +117,10 @@ var requestIDPattern = regexp.MustCompile(`name="request" value="([^"]+)"`)
 
 // authorize walks through the consent page and returns the redirect it ends with.
 func (ot *oauthTest) authorize(clientID, redirect, challenge, password string) *http.Response {
+	return ot.authorizeAs(testPhone, clientID, redirect, challenge, password)
+}
+
+func (ot *oauthTest) authorizeAs(phone, clientID, redirect, challenge, password string) *http.Response {
 	q := url.Values{"response_type": {"code"}, "client_id": {clientID}, "redirect_uri": {redirect},
 		"code_challenge": {challenge}, "code_challenge_method": {"S256"}, "state": {"xyz"}}
 	resp, page := ot.do("GET", "/authorize?"+q.Encode(), nil, "")
@@ -95,7 +131,7 @@ func (ot *oauthTest) authorize(clientID, redirect, challenge, password string) *
 	if m == nil {
 		ot.t.Fatalf("no request id in consent page:\n%s", page)
 	}
-	resp, _ = ot.postForm("/authorize", url.Values{"request": {m[1]}, "password": {password}, "action": {"allow"}})
+	resp, _ = ot.postForm("/authorize", url.Values{"request": {m[1]}, "phone": {phone}, "password": {password}, "action": {"allow"}})
 	return resp
 }
 
@@ -183,7 +219,7 @@ func TestOAuthFlow(t *testing.T) {
 	}
 
 	// Revoking everything signs the client out.
-	if _, err := ot.auth.RevokeAll(context.Background()); err != nil {
+	if _, err := ot.auth.RevokeTokens(context.Background(), ""); err != nil {
 		t.Fatal(err)
 	}
 	if resp, _ := mcpPost(access); resp.StatusCode != 401 {

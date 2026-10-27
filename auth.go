@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -24,19 +23,19 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// AuthServer is a minimal OAuth 2.1 authorization server for a single owner, implementing
-// what MCP clients such as claude.ai custom connectors need: authorization server and
-// protected resource metadata, dynamic client registration, the authorization code flow
-// with mandatory PKCE, and rotating refresh tokens.
+// AuthServer is a minimal OAuth 2.1 authorization server implementing what MCP clients
+// such as claude.ai custom connectors need: authorization server and protected resource
+// metadata, dynamic client registration, the authorization code flow with mandatory PKCE,
+// and rotating refresh tokens.
 //
-// Consent is gated by the owner's password. Only hashes of codes and tokens are stored,
-// so a leaked database can't be replayed.
+// Consent is gated by an account's phone number and password, and every code and token
+// is bound to that one account. Only hashes of codes and tokens are stored, so a leaked
+// database can't be replayed.
 type AuthServer struct {
-	db           *sql.DB
-	base         *url.URL // public base URL, e.g. https://wa.example.com
-	passwordHash []byte
-	redirects    RedirectPolicy
-	limiter      *loginLimiter
+	*AccountStore
+	base      *url.URL // public base URL, e.g. https://wa.example.com
+	redirects RedirectPolicy
+	limiter   *loginLimiter
 
 	mu      sync.Mutex
 	pending map[string]*pendingAuth // consent pages that haven't been submitted yet
@@ -59,8 +58,14 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
 	redirect_uris TEXT NOT NULL,
 	created_at    INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS accounts (
+	id            TEXT PRIMARY KEY, -- phone number, digits only
+	password_hash TEXT NOT NULL,
+	created_at    INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS oauth_codes (
 	code_hash      TEXT PRIMARY KEY,
+	account_id     TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
 	client_id      TEXT NOT NULL,
 	redirect_uri   TEXT NOT NULL,
 	code_challenge TEXT NOT NULL,
@@ -70,6 +75,7 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
 );
 CREATE TABLE IF NOT EXISTS oauth_tokens (
 	token_hash TEXT PRIMARY KEY,
+	account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
 	kind       TEXT NOT NULL, -- access or refresh
 	client_id  TEXT NOT NULL,
 	scope      TEXT NOT NULL,
@@ -77,12 +83,17 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
 	expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS oauth_tokens_expiry ON oauth_tokens (expires_at);
+CREATE INDEX IF NOT EXISTS oauth_tokens_account ON oauth_tokens (account_id);
 `
 
 type pendingAuth struct {
 	clientID, clientName, redirectURI, state, challenge, scope, resource string
 	expires                                                              time.Time
 }
+
+// dummyHash is compared against when an unknown phone number signs in, so the response
+// time doesn't reveal which numbers have accounts.
+var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("not a real password"), 12)
 
 // RedirectPolicy decides which OAuth redirect URIs clients may register.
 type RedirectPolicy struct {
@@ -123,24 +134,14 @@ func (p RedirectPolicy) Allowed(raw string) bool {
 	return false
 }
 
-func NewAuthServer(dbPath string, publicURL string, passwordHash []byte, redirects RedirectPolicy) (*AuthServer, error) {
+func NewAuthServer(accounts *AccountStore, publicURL string, redirects RedirectPolicy) (*AuthServer, error) {
 	base, err := url.Parse(strings.TrimRight(publicURL, "/"))
 	if err != nil || base.Host == "" || (base.Scheme != "https" && !isLoopbackHost(base.Hostname())) {
 		return nil, fmt.Errorf("public URL must be an https:// URL (or http://localhost for testing), got %q", publicURL)
 	}
-	db, err := sql.Open("sqlite", sqliteDSN(dbPath))
-	if err != nil {
-		return nil, err
-	}
-	if _, err = db.Exec(authSchema); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	restrictPermissions(dbPath)
 	a := &AuthServer{
-		db:           db,
+		AccountStore: accounts,
 		base:         base,
-		passwordHash: passwordHash,
 		redirects:    redirects,
 		limiter:      newLoginLimiter(),
 		pending:      make(map[string]*pendingAuth),
@@ -148,8 +149,6 @@ func NewAuthServer(dbPath string, publicURL string, passwordHash []byte, redirec
 	go a.cleanupLoop()
 	return a, nil
 }
-
-func (a *AuthServer) Close() error { return a.db.Close() }
 
 func (a *AuthServer) url(path string) string { return a.base.String() + path }
 
@@ -184,11 +183,24 @@ func (a *AuthServer) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /revoke", a.revoke)
 }
 
-// Protect wraps the MCP handler so that only requests with a valid access token get through.
+type accountKey struct{}
+
+// AccountFromContext returns the account a request was authenticated as.
+func AccountFromContext(ctx context.Context) (string, bool) {
+	id, ok := ctx.Value(accountKey{}).(string)
+	return id, ok && id != ""
+}
+
+// Protect wraps the MCP handler so that only requests with a valid access token get through,
+// and records which account the token belongs to in the request context.
 func (a *AuthServer) Protect(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok || token == "" || !a.validAccessToken(r.Context(), token) {
+		account := ""
+		if ok && token != "" {
+			account = a.accessTokenAccount(r.Context(), token)
+		}
+		if account == "" {
 			challenge := fmt.Sprintf(`Bearer resource_metadata="%s", scope="%s"`, a.url("/.well-known/oauth-protected-resource/mcp"), scopeAll)
 			if ok {
 				challenge += `, error="invalid_token"`
@@ -197,16 +209,21 @@ func (a *AuthServer) Protect(next http.Handler) http.Handler {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), accountKey{}, account)))
 	})
 }
 
-func (a *AuthServer) validAccessToken(ctx context.Context, token string) bool {
+// accessTokenAccount returns the account a valid access token belongs to, or "".
+func (a *AuthServer) accessTokenAccount(ctx context.Context, token string) string {
 	var expires int64
-	var resource string
-	err := a.db.QueryRowContext(ctx, `SELECT expires_at, resource FROM oauth_tokens WHERE token_hash = ? AND kind = 'access'`,
-		hashSecret(token)).Scan(&expires, &resource)
-	return err == nil && time.Now().Unix() < expires && resource == a.ResourceURL()
+	var resource, account string
+	err := a.db.QueryRowContext(ctx, `SELECT t.expires_at, t.resource, t.account_id FROM oauth_tokens t
+		JOIN accounts a ON a.id = t.account_id WHERE t.token_hash = ? AND t.kind = 'access'`,
+		hashSecret(token)).Scan(&expires, &resource, &account)
+	if err != nil || time.Now().Unix() >= expires || resource != a.ResourceURL() {
+		return ""
+	}
+	return account
 }
 
 func (a *AuthServer) protectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
@@ -349,7 +366,7 @@ func (a *AuthServer) authorizePage(w http.ResponseWriter, r *http.Request) {
 	}
 	a.pending[id] = p
 	a.mu.Unlock()
-	a.renderConsent(w, http.StatusOK, id, p, "")
+	a.renderConsent(w, r, http.StatusOK, id, p, "")
 }
 
 func (a *AuthServer) validResource(resource string) bool {
@@ -376,22 +393,31 @@ func (a *AuthServer) authorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		redirectWithParams(w, r, p.redirectURI, url.Values{"error": {"access_denied"}, "state": {p.state}, "iss": {a.base.String()}})
 		return
 	}
-	if wait := a.limiter.blockedFor(); wait > 0 {
-		a.renderConsent(w, http.StatusTooManyRequests, id, p,
-			fmt.Sprintf("Too many wrong passwords. Try again in %d minutes.", int(wait.Minutes())+1))
+	account, err := NormalizePhone(r.PostForm.Get("phone"))
+	if err != nil {
+		a.renderConsent(w, r, http.StatusBadRequest, id, p, "Enter your WhatsApp number in international format, e.g. +14155551234.")
 		return
 	}
-	if bcrypt.CompareHashAndPassword(a.passwordHash, []byte(r.PostForm.Get("password"))) != nil {
-		a.limiter.fail()
-		a.renderConsent(w, http.StatusUnauthorized, id, p, "Wrong password.")
+	if wait := a.limiter.blockedFor(account); wait > 0 {
+		a.renderConsent(w, r, http.StatusTooManyRequests, id, p,
+			fmt.Sprintf("Too many failed sign-ins. Try again in %d minutes.", int(wait.Minutes())+1))
 		return
 	}
-	a.limiter.succeed()
+	hash, err := a.PasswordHash(r.Context(), account)
+	if err != nil {
+		hash = dummyHash
+	}
+	if bcrypt.CompareHashAndPassword(hash, []byte(r.PostForm.Get("password"))) != nil || err != nil {
+		a.limiter.fail(account)
+		a.renderConsent(w, r, http.StatusUnauthorized, id, p, "Wrong phone number or password.")
+		return
+	}
+	a.limiter.succeed(account)
 	a.dropPending(id)
 
 	code := randomToken(32)
-	if _, err := a.db.ExecContext(r.Context(), `INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, code_challenge, scope, resource, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, hashSecret(code), p.clientID, p.redirectURI, p.challenge, p.scope, p.resource,
+	if _, err := a.db.ExecContext(r.Context(), `INSERT INTO oauth_codes (code_hash, account_id, client_id, redirect_uri, code_challenge, scope, resource, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, hashSecret(code), account, p.clientID, p.redirectURI, p.challenge, p.scope, p.resource,
 		time.Now().Add(authCodeTTL).Unix()); err != nil {
 		renderMessage(w, http.StatusInternalServerError, "Server error", "Couldn't complete sign-in.")
 		return
@@ -424,12 +450,12 @@ func (a *AuthServer) token(w http.ResponseWriter, r *http.Request) {
 
 func (a *AuthServer) exchangeCode(w http.ResponseWriter, r *http.Request, f url.Values) {
 	ctx := r.Context()
-	var clientID, redirectURI, challenge, scope, resource string
+	var account, clientID, redirectURI, challenge, scope, resource string
 	var expires int64
 	// Codes are single use: delete and read in one statement so a replay finds nothing.
 	err := a.db.QueryRowContext(ctx, `DELETE FROM oauth_codes WHERE code_hash = ?
-		RETURNING client_id, redirect_uri, code_challenge, scope, resource, expires_at`, hashSecret(f.Get("code"))).
-		Scan(&clientID, &redirectURI, &challenge, &scope, &resource, &expires)
+		RETURNING account_id, client_id, redirect_uri, code_challenge, scope, resource, expires_at`, hashSecret(f.Get("code"))).
+		Scan(&account, &clientID, &redirectURI, &challenge, &scope, &resource, &expires)
 	if err != nil || time.Now().Unix() > expires {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired authorization code")
 		return
@@ -446,17 +472,17 @@ func (a *AuthServer) exchangeCode(w http.ResponseWriter, r *http.Request, f url.
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "PKCE verification failed")
 		return
 	}
-	a.issueTokens(w, r, clientID, scope, resource)
+	a.issueTokens(w, r, account, clientID, scope, resource)
 }
 
 func (a *AuthServer) refresh(w http.ResponseWriter, r *http.Request, f url.Values) {
 	ctx := r.Context()
-	var clientID, scope, resource string
+	var account, clientID, scope, resource string
 	var expires int64
 	// Refresh tokens rotate: the presented one is consumed and a new one issued.
 	err := a.db.QueryRowContext(ctx, `DELETE FROM oauth_tokens WHERE token_hash = ? AND kind = 'refresh'
-		RETURNING client_id, scope, resource, expires_at`, hashSecret(f.Get("refresh_token"))).
-		Scan(&clientID, &scope, &resource, &expires)
+		RETURNING account_id, client_id, scope, resource, expires_at`, hashSecret(f.Get("refresh_token"))).
+		Scan(&account, &clientID, &scope, &resource, &expires)
 	if err != nil || time.Now().Unix() > expires {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired refresh token")
 		return
@@ -465,18 +491,18 @@ func (a *AuthServer) refresh(w http.ResponseWriter, r *http.Request, f url.Value
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "refresh token was issued to another client")
 		return
 	}
-	a.issueTokens(w, r, clientID, scope, resource)
+	a.issueTokens(w, r, account, clientID, scope, resource)
 }
 
-func (a *AuthServer) issueTokens(w http.ResponseWriter, r *http.Request, clientID, scope, resource string) {
+func (a *AuthServer) issueTokens(w http.ResponseWriter, r *http.Request, account, clientID, scope, resource string) {
 	access, refresh := randomToken(32), randomToken(32)
 	now := time.Now()
 	err := withTx(r.Context(), a.db, func(tx *sql.Tx) error {
-		const q = `INSERT INTO oauth_tokens (token_hash, kind, client_id, scope, resource, expires_at) VALUES (?, ?, ?, ?, ?, ?)`
-		if _, err := tx.Exec(q, hashSecret(access), "access", clientID, scope, resource, now.Add(accessTokenTTL).Unix()); err != nil {
+		const q = `INSERT INTO oauth_tokens (token_hash, account_id, kind, client_id, scope, resource, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+		if _, err := tx.Exec(q, hashSecret(access), account, "access", clientID, scope, resource, now.Add(accessTokenTTL).Unix()); err != nil {
 			return err
 		}
-		_, err := tx.Exec(q, hashSecret(refresh), "refresh", clientID, scope, resource, now.Add(refreshTokenTTL).Unix())
+		_, err := tx.Exec(q, hashSecret(refresh), account, "refresh", clientID, scope, resource, now.Add(refreshTokenTTL).Unix())
 		return err
 	})
 	if err != nil {
@@ -499,16 +525,6 @@ func (a *AuthServer) revoke(w http.ResponseWriter, r *http.Request) {
 		_, _ = a.db.ExecContext(r.Context(), `DELETE FROM oauth_tokens WHERE token_hash = ?`, hashSecret(r.PostForm.Get("token")))
 	}
 	w.WriteHeader(http.StatusOK)
-}
-
-// RevokeAll signs out every client.
-func (a *AuthServer) RevokeAll(ctx context.Context) (int64, error) {
-	res, err := a.db.ExecContext(ctx, `DELETE FROM oauth_tokens`)
-	if err != nil {
-		return 0, err
-	}
-	_, _ = a.db.ExecContext(ctx, `DELETE FROM oauth_codes`)
-	return res.RowsAffected()
 }
 
 func verifyPKCE(verifier, challenge string) bool {
@@ -607,38 +623,47 @@ func contains(list []string, s string) bool {
 	return false
 }
 
-// loginLimiter slows down password guessing: after 5 failures in 15 minutes the consent
-// form locks for 15 minutes. It's global rather than per IP because behind a tunnel every
-// request comes from the same address.
+// loginLimiter slows down password guessing. Each account locks for 15 minutes after 5
+// failures in 15 minutes, and all sign-ins lock after 30 failures across accounts, which
+// stops spraying one password over many numbers. Limits aren't per IP because behind a
+// tunnel every request comes from the same address.
 type loginLimiter struct {
 	mu            sync.Mutex
-	failures      []time.Time
-	lockedUntil   time.Time
+	failures      map[string][]time.Time // per account; "" holds all failures
+	lockedUntil   map[string]time.Time
 	registrations []time.Time
 }
 
-func newLoginLimiter() *loginLimiter { return &loginLimiter{} }
-
-func (l *loginLimiter) blockedFor() time.Duration {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return time.Until(l.lockedUntil)
+func newLoginLimiter() *loginLimiter {
+	return &loginLimiter{failures: make(map[string][]time.Time), lockedUntil: make(map[string]time.Time)}
 }
 
-func (l *loginLimiter) fail() {
+func (l *loginLimiter) blockedFor(account string) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return max(time.Until(l.lockedUntil[account]), time.Until(l.lockedUntil[""]))
+}
+
+func (l *loginLimiter) fail(account string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
-	l.failures = append(pruneBefore(l.failures, now.Add(-15*time.Minute)), now)
-	if len(l.failures) >= 5 {
-		l.lockedUntil = now.Add(15 * time.Minute)
-		l.failures = nil
+	for key, limit := range map[string]int{account: 5, "": 30} {
+		l.failures[key] = append(pruneBefore(l.failures[key], now.Add(-15*time.Minute)), now)
+		if len(l.failures[key]) >= limit {
+			l.lockedUntil[key] = now.Add(15 * time.Minute)
+			delete(l.failures, key)
+		}
+	}
+	// Keep the maps from growing without bound when many numbers are tried.
+	if len(l.failures) > 10000 {
+		l.failures = map[string][]time.Time{"": l.failures[""]}
 	}
 }
 
-func (l *loginLimiter) succeed() {
+func (l *loginLimiter) succeed(account string) {
 	l.mu.Lock()
-	l.failures = nil
+	delete(l.failures, account)
 	l.mu.Unlock()
 }
 
@@ -677,7 +702,7 @@ h1 { font-size: 20px; margin: 0 0 8px; }
 p { margin: 0 0 16px; color: var(--muted); }
 strong { color: var(--fg); }
 label { display: block; font-weight: 600; margin-bottom: 6px; }
-input[type=password] { width: 100%; padding: 12px; font: inherit; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: inherit; }
+input[type=password], input[type=tel] { width: 100%; padding: 12px; margin-bottom: 14px; font: inherit; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: inherit; }
 .row { display: flex; gap: 10px; margin-top: 18px; }
 button { flex: 1; padding: 12px; font: inherit; font-weight: 600; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
@@ -689,15 +714,17 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 <p>It will return to <strong>{{.RedirectHost}}</strong>.</p>
 <form method="post" action="/authorize">
 <input type="hidden" name="request" value="{{.Request}}">
-<label for="password">Server password</label>
-<input type="password" id="password" name="password" autocomplete="current-password" autofocus>
+<label for="phone">WhatsApp number</label>
+<input type="tel" id="phone" name="phone" autocomplete="username" placeholder="+14155551234" value="{{.Phone}}" autofocus>
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autocomplete="current-password">
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
 <div class="row"><button type="submit" name="action" value="deny">Deny</button><button class="primary" type="submit" name="action" value="allow">Allow</button></div>
 </form>
 {{else}}<p>{{.Message}}</p>{{end}}
 </main></body></html>`))
 
-func (a *AuthServer) renderConsent(w http.ResponseWriter, status int, id string, p *pendingAuth, errMsg string) {
+func (a *AuthServer) renderConsent(w http.ResponseWriter, r *http.Request, status int, id string, p *pendingAuth, errMsg string) {
 	redirect, _ := url.Parse(p.redirectURI)
 	name := p.clientName
 	if name == "" {
@@ -708,6 +735,7 @@ func (a *AuthServer) renderConsent(w http.ResponseWriter, status int, id string,
 	w.WriteHeader(status)
 	_ = pageTemplate.Execute(w, map[string]string{
 		"Title": "Connect WhatsApp", "Request": id, "ClientName": name, "RedirectHost": redirect.Host, "Error": errMsg,
+		"Phone": r.PostFormValue("phone"),
 	})
 }
 
@@ -731,27 +759,4 @@ func isLoopbackHost(host string) bool {
 	}
 	host = strings.Trim(host, "[]")
 	return host == "localhost" || net.ParseIP(host).IsLoopback()
-}
-
-// LoadPasswordHash returns the bcrypt hash guarding the consent page. It comes from
-// WHATSAPP_MCP_PASSWORD if set, otherwise from the hash file; if neither exists a random
-// password is generated, saved (hashed) and returned so it can be shown once.
-func LoadPasswordHash(hashFile string) (hash []byte, generated string, err error) {
-	if pw := os.Getenv("WHATSAPP_MCP_PASSWORD"); pw != "" {
-		hash, err = HashPassword(pw)
-		return hash, "", err
-	}
-	if data, err := os.ReadFile(hashFile); err == nil {
-		return []byte(strings.TrimSpace(string(data))), "", nil
-	} else if !os.IsNotExist(err) {
-		return nil, "", err
-	}
-	generated = GeneratePassword()
-	if hash, err = HashPassword(generated); err != nil {
-		return nil, "", err
-	}
-	if err = os.WriteFile(hashFile, hash, 0o600); err != nil {
-		return nil, "", err
-	}
-	return hash, generated, nil
 }
