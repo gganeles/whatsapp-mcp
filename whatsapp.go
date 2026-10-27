@@ -37,6 +37,9 @@ type WhatsApp struct {
 	pairErr   error
 	pairing   bool
 	syncCount int // history sync batches processed since start
+
+	groupMu    sync.Mutex
+	groupNames map[types.JID]string // known group names; "" means a lookup is pending or failed
 }
 
 func NewWhatsApp(ctx context.Context, dataDir string, log waLog.Logger) (*WhatsApp, error) {
@@ -50,12 +53,12 @@ func NewWhatsApp(ctx context.Context, dataDir string, log waLog.Logger) (*WhatsA
 	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
 	store.SetOSInfo("WhatsApp MCP", [3]uint32{0, 1, 0})
 
-	container, err := sqlstore.New(ctx, "sqlite3",
-		"file:"+filepath.Join(dataDir, "whatsapp.db")+"?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000",
-		log.Sub("Database"))
+	sessionDB := filepath.Join(dataDir, "whatsapp.db")
+	container, err := sqlstore.New(ctx, "sqlite", sqliteDSN(sessionDB), log.Sub("Database"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open session database: %w", err)
 	}
+	restrictPermissions(sessionDB)
 	device, err := container.GetFirstDevice(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load device: %w", err)
@@ -70,6 +73,8 @@ func NewWhatsApp(ctx context.Context, dataDir string, log waLog.Logger) (*WhatsA
 		DataDir: dataDir,
 		qrPath:  filepath.Join(dataDir, "login-qr.png"),
 		log:     log,
+
+		groupNames: make(map[types.JID]string),
 	}
 	wa.Client.AddEventHandler(wa.handleEvent)
 	return wa, nil
@@ -251,22 +256,20 @@ func (wa *WhatsApp) handleEvent(rawEvt any) {
 	ctx := context.Background()
 	switch evt := rawEvt.(type) {
 	case *events.Message:
-		wa.storeMessage(ctx, evt)
+		wa.storeMessage(ctx, wa.Store, evt)
 	case *events.HistorySync:
 		wa.storeHistorySync(ctx, evt.Data)
 	case *events.Connected:
 		wa.log.Infof("Connected to WhatsApp")
 		go wa.refreshGroups(ctx)
-	case *events.PushName:
-		// Contact names are kept in whatsmeow's own store; nothing to do here.
 	case *events.GroupInfo:
 		if evt.Name != nil {
-			_ = wa.Store.UpsertChat(ctx, evt.JID.String(), evt.Name.Name, true, time.Time{})
+			wa.setGroupName(ctx, evt.JID, evt.Name.Name)
 		}
 	case *events.JoinedGroup:
-		_ = wa.Store.UpsertChat(ctx, evt.JID.String(), evt.GroupName.Name, true, time.Time{})
+		wa.setGroupName(ctx, evt.JID, evt.GroupName.Name)
 	case *events.LoggedOut:
-		wa.log.Warnf("Logged out from WhatsApp (reason: %s); run the login command again to re-pair", evt.Reason)
+		wa.log.Warnf("Logged out from WhatsApp (reason: %s); link the account again with pair_device or the login command", evt.Reason)
 	}
 }
 
@@ -278,8 +281,15 @@ func (wa *WhatsApp) refreshGroups(ctx context.Context) {
 		return
 	}
 	for _, g := range groups {
-		_ = wa.Store.UpsertChat(ctx, g.JID.String(), g.Name, true, time.Time{})
+		wa.setGroupName(ctx, g.JID, g.Name)
 	}
+}
+
+func (wa *WhatsApp) setGroupName(ctx context.Context, jid types.JID, name string) {
+	wa.groupMu.Lock()
+	wa.groupNames[jid] = name
+	wa.groupMu.Unlock()
+	_ = wa.Store.UpsertChat(ctx, jid.String(), name, true, time.Time{})
 }
 
 // normalizeJID maps LID-addressed users to their phone-number JID when the mapping is
@@ -309,26 +319,44 @@ func (wa *WhatsApp) ContactName(ctx context.Context, jid types.JID) string {
 	return ""
 }
 
-func (wa *WhatsApp) chatName(ctx context.Context, chat types.JID) string {
-	if chat.Server == types.GroupServer {
-		if existing, _ := wa.Store.GetChat(ctx, chat.String()); existing != nil && existing.Name != "" {
-			return existing.Name
+// chatName returns a display name for a chat without blocking on the network: unknown
+// group names are looked up in the background and filled in when they arrive.
+func (wa *WhatsApp) chatName(ctx context.Context, st *MessageStore, chat types.JID) string {
+	if chat.Server != types.GroupServer {
+		if name := wa.ContactName(ctx, chat); name != "" {
+			return name
 		}
-		if info, err := wa.Client.GetGroupInfo(ctx, chat); err == nil {
-			return info.Name
+		if chat.Server == types.DefaultUserServer {
+			return "+" + chat.User
 		}
 		return ""
 	}
-	if name := wa.ContactName(ctx, chat); name != "" {
+	wa.groupMu.Lock()
+	name, known := wa.groupNames[chat]
+	if !known {
+		wa.groupNames[chat] = ""
+	}
+	wa.groupMu.Unlock()
+	if known {
 		return name
 	}
-	if chat.Server == types.DefaultUserServer {
-		return "+" + chat.User
+	if name, _ = st.ChatName(ctx, chat.String()); name != "" {
+		wa.groupMu.Lock()
+		wa.groupNames[chat] = name
+		wa.groupMu.Unlock()
+		return name
+	}
+	if wa.Client.IsConnected() {
+		go func() {
+			if info, err := wa.Client.GetGroupInfo(context.Background(), chat); err == nil {
+				wa.setGroupName(context.Background(), chat, info.Name)
+			}
+		}()
 	}
 	return ""
 }
 
-func (wa *WhatsApp) storeMessage(ctx context.Context, evt *events.Message) {
+func (wa *WhatsApp) storeMessage(ctx context.Context, st *MessageStore, evt *events.Message) {
 	chat := wa.normalizeJID(ctx, evt.Info.Chat)
 	if chat.Server == types.BroadcastServer && chat.User == "status" {
 		return // skip status updates
@@ -344,10 +372,10 @@ func (wa *WhatsApp) storeMessage(ctx context.Context, evt *events.Message) {
 		switch pm.GetType() {
 		case waE2E.ProtocolMessage_MESSAGE_EDIT:
 			if text, _ := extractContent(pm.GetEditedMessage()); text != "" {
-				_ = wa.Store.EditMessage(ctx, chat.String(), target, text)
+				_ = st.EditMessage(ctx, chat.String(), target, text)
 			}
 		case waE2E.ProtocolMessage_REVOKE:
-			_ = wa.Store.DeleteMessage(ctx, chat.String(), target)
+			_ = st.DeleteMessage(ctx, chat.String(), target)
 		}
 		return
 	}
@@ -368,10 +396,10 @@ func (wa *WhatsApp) storeMessage(ctx context.Context, evt *events.Message) {
 		m.SenderName = name
 	}
 
-	if err := wa.Store.UpsertChat(ctx, m.ChatJID, wa.chatName(ctx, chat), chat.Server == types.GroupServer, m.Timestamp); err != nil {
+	if err := st.UpsertChat(ctx, m.ChatJID, wa.chatName(ctx, st, chat), chat.Server == types.GroupServer, m.Timestamp); err != nil {
 		wa.log.Warnf("Failed to store chat %s: %v", m.ChatJID, err)
 	}
-	if err := wa.Store.SaveMessage(ctx, m); err != nil {
+	if err := st.SaveMessage(ctx, m); err != nil {
 		wa.log.Warnf("Failed to store message %s: %v", m.ID, err)
 	}
 }
@@ -381,32 +409,45 @@ func (wa *WhatsApp) storeHistorySync(ctx context.Context, data *waHistorySync.Hi
 	wa.syncCount++
 	wa.mu.Unlock()
 	stored := 0
-	for _, conv := range data.GetConversations() {
-		chatJID, err := types.ParseJID(conv.GetID())
-		if err != nil {
-			continue
-		}
-		name := conv.GetName()
-		if name == "" {
-			name = conv.GetDisplayName()
-		}
-		var last time.Time
-		if ts := conv.GetConversationTimestamp(); ts > 0 {
-			last = time.Unix(int64(ts), 0)
-		}
-		normalized := wa.normalizeJID(ctx, chatJID)
-		if name == "" {
-			name = wa.chatName(ctx, normalized)
-		}
-		_ = wa.Store.UpsertChat(ctx, normalized.String(), name, normalized.Server == types.GroupServer, last)
-		for _, hm := range conv.GetMessages() {
-			evt, err := wa.Client.ParseWebMessage(chatJID, hm.GetMessage())
+	err := wa.Store.WithTx(ctx, func(tx *MessageStore) error {
+		for _, conv := range data.GetConversations() {
+			chatJID, err := types.ParseJID(conv.GetID())
 			if err != nil {
 				continue
 			}
-			wa.storeMessage(ctx, evt)
-			stored++
+			normalized := wa.normalizeJID(ctx, chatJID)
+			name := conv.GetName()
+			if name == "" {
+				name = conv.GetDisplayName()
+			}
+			if name == "" {
+				name = wa.chatName(ctx, tx, normalized)
+			} else if normalized.Server == types.GroupServer {
+				wa.groupMu.Lock()
+				wa.groupNames[normalized] = name
+				wa.groupMu.Unlock()
+			}
+			var last time.Time
+			if ts := conv.GetConversationTimestamp(); ts > 0 {
+				last = time.Unix(int64(ts), 0)
+			}
+			if err = tx.UpsertChat(ctx, normalized.String(), name, normalized.Server == types.GroupServer, last); err != nil {
+				return err
+			}
+			for _, hm := range conv.GetMessages() {
+				evt, err := wa.Client.ParseWebMessage(chatJID, hm.GetMessage())
+				if err != nil {
+					continue
+				}
+				wa.storeMessage(ctx, tx, evt)
+				stored++
+			}
 		}
+		return nil
+	})
+	if err != nil {
+		wa.log.Errorf("Failed to store history sync: %v", err)
+		return
 	}
 	wa.log.Infof("History sync (%s): stored %d messages from %d conversations",
 		data.GetSyncType(), stored, len(data.GetConversations()))
@@ -558,6 +599,6 @@ func (wa *WhatsApp) recordSent(ctx context.Context, to types.JID, id types.Messa
 		m.SenderJID = own.ToNonAD().String()
 	}
 	m.Timestamp = ts
-	_ = wa.Store.UpsertChat(ctx, m.ChatJID, wa.chatName(ctx, to), to.Server == types.GroupServer, ts)
+	_ = wa.Store.UpsertChat(ctx, m.ChatJID, wa.chatName(ctx, wa.Store, to), to.Server == types.GroupServer, ts)
 	_ = wa.Store.SaveMessage(ctx, m)
 }

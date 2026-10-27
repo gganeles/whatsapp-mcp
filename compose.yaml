@@ -1,0 +1,33 @@
+# Runs the server plus a Cloudflare Tunnel, so it's reachable over HTTPS without opening
+# any ports on your network. Copy .env.example to .env and fill it in first.
+services:
+  whatsapp-mcp:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      WHATSAPP_MCP_HTTP: 0.0.0.0:8080
+      # cloudflared reaches the server by its service name.
+      WHATSAPP_MCP_ALLOWED_HOSTS: whatsapp-mcp:8080
+    volumes:
+      - whatsapp-data:/data
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [internal]
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in .env}
+    depends_on: [whatsapp-mcp]
+    networks: [internal]
+
+volumes:
+  whatsapp-data:
+
+networks:
+  internal:
