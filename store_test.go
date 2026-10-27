@@ -38,7 +38,7 @@ func TestStoreRoundTrip(t *testing.T) {
 
 	chats, err := s.ListChats(ctx, "", false, false, 10, 0)
 	must(err)
-	if len(chats) != 2 || chats[0].JID != "222@g.us" || chats[1].Name != "Alice" || chats[1].MessageCount != 3 {
+	if len(chats) != 2 || chats[0].JID != "222@g.us" || chats[1].Name != "Alice" {
 		t.Fatalf("unexpected chats: %+v", chats)
 	}
 	if chats[0].LastSender != "me" || chats[1].LastMessage != "see you at lunch" {

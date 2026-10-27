@@ -38,3 +38,5 @@ go.work.sum
 *.db-shm
 *.db-wal
 .whatsapp-mcp/
+
+.env
