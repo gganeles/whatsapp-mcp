@@ -1,0 +1,7 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Termux:Boot runs every executable in ~/.termux/boot/ when the phone starts.
+# termux/install.sh copies this file there.
+termux-wake-lock
+# Give the network a moment to come up after boot.
+sleep 20
+exec /data/data/com.termux/files/usr/bin/whatsapp-mcp-service start
