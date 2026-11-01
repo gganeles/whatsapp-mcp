@@ -66,6 +66,31 @@ sleep) with Docker, and a domain on Cloudflare. The tunnel gives you HTTPS witho
 
 To use it from Claude Code too: `claude mcp add --transport http whatsapp https://whatsapp.example.com/mcp`.
 
+### On a Linux server without Docker
+
+`linux/install.sh` installs the server natively on any Linux: Oracle Linux, RHEL, Rocky, Alma,
+Fedora, Amazon Linux, Debian, Ubuntu, openSUSE, Arch, or Alpine, on x86-64 or ARM (such as Oracle
+Cloud's Ampere machines). First create the Cloudflare tunnel as in step 1 above, but point its public
+hostname at `http://localhost:8080`. Then:
+
+```sh
+git clone https://github.com/gganeles/whatsapp-mcp && cd whatsapp-mcp
+sudo sh linux/install.sh
+```
+
+The installer installs `curl` and `tar` with the system's package manager if they're missing,
+downloads its own Go toolchain (the distro's Go is usually too old), builds the server, and asks for
+your public URL and tunnel token. It then offers to create an account and starts the server and
+tunnel as systemd (or OpenRC) services that start on boot and restart if they exit. The server runs
+as its own `whatsapp-mcp` user, listens only on `127.0.0.1:8080`, and keeps its data in
+`/var/lib/whatsapp-mcp`. Leave the token empty to use your own HTTPS reverse proxy instead of a
+tunnel.
+
+Manage accounts with `sudo whatsapp-mcp-admin user add|passwd|remove|list`, and the services with
+`systemctl status|restart whatsapp-mcp whatsapp-mcp-tunnel` (logs: `journalctl -u whatsapp-mcp -f`).
+Settings live in `/etc/whatsapp-mcp/env`. To update, `git pull` and run the installer again; it keeps
+your settings.
+
 ### On an Android phone (Termux)
 
 You can host the server on the phone itself with [Termux](https://termux.dev), no Docker needed.

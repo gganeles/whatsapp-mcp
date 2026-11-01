@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+# Installed by linux/install.sh as /etc/init.d/whatsapp-mcp on OpenRC systems (Alpine, Gentoo, ...).
+name="WhatsApp MCP server"
+command=/usr/local/libexec/whatsapp-mcp/run
+command_args=server
+command_user=whatsapp-mcp:whatsapp-mcp
+supervisor=supervise-daemon
+respawn_delay=10
+respawn_max=0
+umask=077
+output_log=/var/log/whatsapp-mcp/server.log
+error_log=/var/log/whatsapp-mcp/server.log
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	checkpath -d -m 0700 -o whatsapp-mcp:whatsapp-mcp /var/lib/whatsapp-mcp
+	checkpath -d -m 0750 -o whatsapp-mcp:whatsapp-mcp /var/log/whatsapp-mcp
+}
