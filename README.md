@@ -66,6 +66,27 @@ sleep) with Docker, and a domain on Cloudflare. The tunnel gives you HTTPS witho
 
 To use it from Claude Code too: `claude mcp add --transport http whatsapp https://whatsapp.example.com/mcp`.
 
+### On an Android phone (Termux)
+
+You can host the server on the phone itself with [Termux](https://termux.dev), no Docker needed.
+First create the Cloudflare tunnel as in step 1 above, but point its public hostname at
+`http://localhost:8080`. Then, in Termux:
+
+```sh
+pkg install git
+git clone https://github.com/gganeles/whatsapp-mcp && cd whatsapp-mcp
+bash termux/install.sh
+```
+
+The installer builds the server, asks for your public URL and tunnel token, offers to create an
+account, and installs a [Termux:Boot](https://wiki.termux.com/wiki/Termux:Boot) script so the server
+and tunnel start when the phone boots. They restart automatically if either one exits. Install the
+Termux:Boot app (from the same store as Termux) and open it once, and set Termux's battery usage to
+Unrestricted so Android doesn't stop it.
+
+Manage it with `whatsapp-mcp-service start|stop|restart|status|logs`. Settings live in
+`~/.config/whatsapp-mcp/env`. To update, `git pull` and run the installer again.
+
 ### Other ways to host
 
 Any HTTPS reverse proxy works: Tailscale Funnel, Caddy, nginx. Run the binary or container with

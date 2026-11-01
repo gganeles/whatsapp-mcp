@@ -1,0 +1,98 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Runs the WhatsApp MCP server and its Cloudflare tunnel in the background on Termux,
+# restarting either one if it exits.
+#
+#   whatsapp-mcp-service start | stop | restart | status | logs
+#
+# Settings come from ~/.config/whatsapp-mcp/env (written by termux/install.sh).
+set -u
+
+CONFIG="$HOME/.config/whatsapp-mcp/env"
+STATE="$HOME/.local/state/whatsapp-mcp"
+mkdir -p "$STATE"
+
+if [ ! -f "$CONFIG" ]; then
+	echo "Missing $CONFIG; run termux/install.sh first." >&2
+	exit 1
+fi
+# shellcheck source=/dev/null
+. "$CONFIG"
+export WHATSAPP_MCP_PUBLIC_URL WHATSAPP_MCP_HTTP WHATSAPP_MCP_READ_ONLY
+export WHATSAPP_MCP_DATA="${WHATSAPP_MCP_DATA:-$HOME/.whatsapp-mcp}"
+
+# supervise NAME CMD...: run CMD forever in the background, logging to $STATE/NAME.log.
+supervise() {
+	local name="$1"
+	shift
+	if is_running "$name"; then
+		echo "$name is already running"
+		return
+	fi
+	local log="$STATE/$name.log"
+	# Keep logs from filling the phone: start fresh once they pass 5 MB.
+	if [ -f "$log" ] && [ "$(stat -c %s "$log")" -gt 5242880 ]; then
+		mv "$log" "$log.old"
+	fi
+	(
+		child=""
+		trap '[ -n "$child" ] && kill "$child" 2>/dev/null; exit 0' TERM INT
+		while true; do
+			echo "=== $(date '+%F %T') starting $name" >>"$log"
+			"$@" >>"$log" 2>&1 &
+			child=$!
+			wait "$child"
+			code=$?
+			echo "=== $(date '+%F %T') $name exited with $code; restarting in 10s" >>"$log"
+			sleep 10
+		done
+	) </dev/null >/dev/null 2>&1 &
+	echo $! >"$STATE/$name.pid"
+	echo "started $name"
+}
+
+is_running() {
+	local pidfile="$STATE/$1.pid"
+	[ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null
+}
+
+stop_one() {
+	local pidfile="$STATE/$1.pid"
+	if is_running "$1"; then
+		kill "$(cat "$pidfile")"
+		echo "stopped $1"
+	fi
+	rm -f "$pidfile"
+}
+
+start() {
+	# Keep the CPU awake so Android doesn't freeze the server while the screen is off.
+	command -v termux-wake-lock >/dev/null && termux-wake-lock
+	supervise server whatsapp-mcp serve
+	if [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
+		# Passed by environment, not argument, so the token doesn't show up in process lists.
+		TUNNEL_TOKEN="$CLOUDFLARE_TUNNEL_TOKEN" supervise tunnel cloudflared tunnel --no-autoupdate run
+	fi
+}
+
+stop() {
+	stop_one tunnel
+	stop_one server
+	command -v termux-wake-unlock >/dev/null && termux-wake-unlock
+}
+
+case "${1:-}" in
+start) start ;;
+stop) stop ;;
+restart) stop; sleep 2; start ;;
+status)
+	for name in server tunnel; do
+		if is_running "$name"; then echo "$name: running"; else echo "$name: stopped"; fi
+	done
+	if whatsapp-mcp healthcheck 2>/dev/null; then echo "health: ok"; else echo "health: not responding"; fi
+	;;
+logs) tail -n 50 -f "$STATE/server.log" "$STATE/tunnel.log" ;;
+*)
+	echo "usage: whatsapp-mcp-service start|stop|restart|status|logs" >&2
+	exit 2
+	;;
+esac
