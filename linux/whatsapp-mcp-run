@@ -1,0 +1,31 @@
+#!/bin/sh
+# Starts the WhatsApp MCP server or its Cloudflare tunnel with the saved settings.
+# The OpenRC services use it; systemd reads the same files with EnvironmentFile.
+#
+#   whatsapp-mcp-run server | tunnel
+#
+# Installed by linux/install.sh as /usr/local/libexec/whatsapp-mcp/run.
+set -eu
+load() {
+	set -a
+	# shellcheck source=/dev/null
+	. "$1"
+	set +a
+}
+case "${1:-}" in
+server)
+	load /etc/whatsapp-mcp/env
+	export WHATSAPP_MCP_DATA=/var/lib/whatsapp-mcp
+	exec /usr/local/bin/whatsapp-mcp serve
+	;;
+tunnel)
+	# TUNNEL_TOKEN is passed by environment, not argument, so it doesn't show up in
+	# process lists.
+	load /etc/whatsapp-mcp/tunnel.env
+	exec /usr/local/bin/cloudflared tunnel --no-autoupdate run
+	;;
+*)
+	echo "usage: $0 server|tunnel" >&2
+	exit 2
+	;;
+esac

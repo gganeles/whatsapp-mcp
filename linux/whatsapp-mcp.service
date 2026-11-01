@@ -1,0 +1,46 @@
+# Installed by linux/install.sh as /etc/systemd/system/whatsapp-mcp.service.
+[Unit]
+Description=WhatsApp MCP server
+Documentation=https://github.com/gganeles/whatsapp-mcp
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=whatsapp-mcp
+Group=whatsapp-mcp
+EnvironmentFile=/etc/whatsapp-mcp/env
+Environment=WHATSAPP_MCP_DATA=/var/lib/whatsapp-mcp
+ExecStart=/usr/local/bin/whatsapp-mcp serve
+Restart=always
+RestartSec=10
+
+# Data lives in /var/lib/whatsapp-mcp, owner-only.
+StateDirectory=whatsapp-mcp
+StateDirectoryMode=0700
+UMask=0077
+
+# Hardening: the server only needs its data directory and the network.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

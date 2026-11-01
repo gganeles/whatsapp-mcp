@@ -1,0 +1,26 @@
+# Installed by linux/install.sh as /etc/systemd/system/whatsapp-mcp-tunnel.service.
+# Runs a Cloudflare Tunnel so the server is reachable over HTTPS without opening ports.
+[Unit]
+Description=Cloudflare Tunnel for the WhatsApp MCP server
+Wants=network-online.target
+After=network-online.target whatsapp-mcp.service
+
+[Service]
+Type=simple
+User=whatsapp-mcp
+Group=whatsapp-mcp
+# TUNNEL_TOKEN comes from here, by environment rather than argument, so it doesn't
+# show up in process lists.
+EnvironmentFile=/etc/whatsapp-mcp/tunnel.env
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
