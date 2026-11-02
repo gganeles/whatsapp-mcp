@@ -50,6 +50,11 @@ CONFIG_DIR=/etc/whatsapp-mcp
 CONFIG=$CONFIG_DIR/env
 TUNNEL_CONFIG=$CONFIG_DIR/tunnel.env
 DATA_DIR=/var/lib/whatsapp-mcp
+ADMIN=/usr/local/sbin/whatsapp-mcp-admin
+
+# sudo on Oracle Linux, RHEL and others resets PATH to a secure_path without /usr/local.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export PATH
 
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
@@ -200,7 +205,12 @@ else
 fi
 mkdir -p "$LIBEXEC"
 install -m 755 "$REPO/linux/whatsapp-mcp-run" "$LIBEXEC/run"
-install -m 755 "$REPO/linux/whatsapp-mcp-admin" /usr/local/sbin/whatsapp-mcp-admin
+install -m 755 "$REPO/linux/whatsapp-mcp-admin" "$ADMIN"
+# Also put it where `sudo whatsapp-mcp-admin` finds it: sudo's secure_path usually lacks
+# /usr/local/sbin.
+if [ ! -e /usr/sbin/whatsapp-mcp-admin ] || [ -L /usr/sbin/whatsapp-mcp-admin ]; then
+	ln -sf "$ADMIN" /usr/sbin/whatsapp-mcp-admin
+fi
 echo "installed $BIN"
 
 # ---------------------------------------------------------------- service user
@@ -322,7 +332,7 @@ fi
 
 # SELinux (Oracle Linux, RHEL, Fedora): give the new files their default labels.
 if command -v restorecon >/dev/null 2>&1; then
-	restorecon -R "$BIN" "$LIBEXEC" /usr/local/sbin/whatsapp-mcp-admin "$CONFIG_DIR" "$DATA_DIR" \
+	restorecon -R "$BIN" "$LIBEXEC" "$ADMIN" "$CONFIG_DIR" "$DATA_DIR" \
 		/usr/local/bin/cloudflared 2>/dev/null || true
 fi
 
@@ -330,11 +340,11 @@ fi
 
 if [ "$INTERACTIVE" = 1 ]; then
 	say "Accounts"
-	whatsapp-mcp-admin user list || true
+	"$ADMIN" user list || true
 	printf 'Add an account now? Enter its WhatsApp number (e.g. +14155551234), or press Enter to skip: ' >/dev/tty
 	IFS= read -r phone </dev/tty || phone=""
 	if [ -n "$phone" ]; then
-		whatsapp-mcp-admin user add "$phone" </dev/tty
+		"$ADMIN" user add "$phone" </dev/tty
 	fi
 fi
 
@@ -385,7 +395,7 @@ esac
 if [ "$INIT" != none ]; then
 	healthy=0
 	for _ in 1 2 3 4 5 6 7 8 9 10; do
-		if whatsapp-mcp-admin healthcheck >/dev/null 2>&1; then healthy=1; break; fi
+		if "$ADMIN" healthcheck >/dev/null 2>&1; then healthy=1; break; fi
 		sleep 1
 	done
 	if [ "$healthy" = 1 ]; then
