@@ -1,0 +1,45 @@
+# Builds the Linux binaries on every push to main and publishes them on the "latest"
+# release, so a server can install without building:
+#   sudo sh linux/install.sh --download
+name: Release binaries
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: |
+          mkdir dist
+          for arch in amd64 arm64 arm; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch GOARM=6 \
+              go build -trimpath -ldflags='-s -w' -o "dist/whatsapp-mcp-linux-$arch" .
+          done
+          (cd dist && sha256sum whatsapp-mcp-linux-* > SHA256SUMS)
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="Built from ${GITHUB_SHA} on $(date -u '+%Y-%m-%d %H:%M UTC'). Install with: sudo sh linux/install.sh --download"
+          git tag -f latest
+          git push -f origin refs/tags/latest
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest dist/* --clobber
+            gh release edit latest --notes "$notes" --latest
+          else
+            gh release create latest dist/* --title "Latest build" --notes "$notes" --latest
+          fi

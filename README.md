@@ -93,7 +93,19 @@ your settings.
 
 #### Using a prebuilt binary
 
-Building takes a while on a small VM. The server is pure Go with no C dependencies, so you can
+Building takes a while on a small VM. Every push to `main` builds Linux binaries for amd64, arm64
+and 32-bit ARM and publishes them on the repository's
+[latest release](https://github.com/gganeles/whatsapp-mcp/releases/tag/latest), so you can skip the
+build entirely:
+
+```sh
+sudo sh linux/install.sh --download
+```
+
+The installer picks the binary for the server's CPU, checks it against the release's `SHA256SUMS`,
+and does the rest as usual. To update, `git pull` and run it again with `--download`.
+
+To compile it yourself instead: the server is pure Go with no C dependencies, so you can
 compile it on any faster computer (Linux, macOS, or Windows with Go 1.26+) for the server's CPU and
 copy it over. Use `amd64` for Intel/AMD servers and `arm64` for ARM ones such as Oracle Cloud's
 Ampere A1 (`uname -m` on the server prints `x86_64` or `aarch64`):
