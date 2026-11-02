@@ -364,6 +364,18 @@ func readNewPassword() (password string, generated bool, err error) {
 			return "", false, err
 		}
 		password = string(raw)
+		// Typed blind, so ask twice: a typo here means a password nobody knows.
+		if password != "" {
+			fmt.Print("Type it again: ")
+			again, err := term.ReadPassword(int(os.Stdin.Fd()))
+			fmt.Println()
+			if err != nil {
+				return "", false, err
+			}
+			if string(again) != password {
+				return "", false, errors.New("the passwords don't match; nothing was changed")
+			}
+		}
 	} else {
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		password = strings.TrimSpace(line)
