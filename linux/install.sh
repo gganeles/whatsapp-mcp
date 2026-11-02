@@ -6,9 +6,10 @@
 #   git clone https://github.com/gganeles/whatsapp-mcp && cd whatsapp-mcp
 #   sudo sh linux/install.sh
 #
-# On a small machine, skip the build by giving it a binary compiled elsewhere (see the
-# README, "Using a prebuilt binary"):
+# On a small machine, skip the build: --download fetches the binary that GitHub builds
+# from main, and --binary uses one you compiled elsewhere (see the README):
 #
+#   sudo sh linux/install.sh --download
 #   sudo sh linux/install.sh --binary ./whatsapp-mcp-linux-amd64
 #
 # Works with apt (Debian, Ubuntu), dnf/yum (Oracle Linux, RHEL, Rocky, Alma, Fedora,
@@ -24,13 +25,18 @@
 #   WHATSAPP_MCP_READ_ONLY    true to disable every tool that sends messages
 #   WHATSAPP_MCP_NONINTERACTIVE=1
 #   WHATSAPP_MCP_BINARY       same as --binary
+#   WHATSAPP_MCP_DOWNLOAD=1   same as --download
 set -eu
 
+RELEASE_URL=${WHATSAPP_MCP_RELEASE_URL:-https://github.com/gganeles/whatsapp-mcp/releases/latest/download}
 PREBUILT=${WHATSAPP_MCP_BINARY:-}
+DOWNLOAD=${WHATSAPP_MCP_DOWNLOAD:-}
+[ "$DOWNLOAD" = 1 ] || DOWNLOAD=""
 while [ $# -gt 0 ]; do
 	case $1 in
 	--binary) [ $# -ge 2 ] || { echo "--binary needs a path" >&2; exit 2; }; PREBUILT=$2; shift 2 ;;
 	--binary=*) PREBUILT=${1#--binary=}; shift ;;
+	--download) DOWNLOAD=1; shift ;;
 	-h | --help) sed -n '2,/^set -eu/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
 	*) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
 	esac
@@ -52,6 +58,7 @@ die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "run it as root, e.g. sudo sh $0"
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 [ -f "$REPO/go.mod" ] || die "run it from the whatsapp-mcp repository checkout."
+[ -z "$PREBUILT" ] || [ -z "$DOWNLOAD" ] || die "use either --binary or --download, not both"
 if [ -n "$PREBUILT" ]; then
 	[ -f "$PREBUILT" ] || die "no such file: $PREBUILT"
 	PREBUILT=$(cd "$(dirname "$PREBUILT")" && pwd)/$(basename "$PREBUILT")
@@ -105,7 +112,7 @@ pkg_install() {
 say "Installing packages ($PM, $INIT, $GOARCH)"
 need=""
 command -v curl >/dev/null 2>&1 || need="$need curl"
-if [ -z "$PREBUILT" ]; then
+if [ -z "$PREBUILT" ] && [ -z "$DOWNLOAD" ]; then
 	command -v tar >/dev/null 2>&1 || need="$need tar"
 	command -v gzip >/dev/null 2>&1 || need="$need gzip"
 fi
@@ -123,6 +130,20 @@ else
 fi
 
 # ---------------------------------------------------------------- build (or prebuilt binary)
+
+if [ -n "$DOWNLOAD" ]; then
+	asset=whatsapp-mcp-linux-$(echo "$GOARCH" | sed 's/armv6l/arm/')
+	say "Downloading $asset from $RELEASE_URL"
+	PREBUILT=$BIN.download
+	trap 'rm -f "$PREBUILT"' EXIT
+	curl -fSL --progress-bar -o "$PREBUILT" "$RELEASE_URL/$asset" ||
+		die "couldn't download $asset; there may be no build for this CPU yet. Run without --download to build here."
+	sums=$(curl -fsSL "$RELEASE_URL/SHA256SUMS") || die "couldn't download SHA256SUMS"
+	want=$(printf '%s\n' "$sums" | awk -v f="$asset" '$2 == f { print $1 }')
+	have=$(sha256sum "$PREBUILT" | awk '{ print $1 }')
+	[ -n "$want" ] && [ "$want" = "$have" ] || die "the downloaded $asset doesn't match its SHA256SUMS entry"
+	echo "checksum ok"
+fi
 
 if [ -n "$PREBUILT" ]; then
 	say "Installing the prebuilt binary $PREBUILT"
@@ -375,7 +396,11 @@ if [ "$INIT" != none ]; then
 fi
 
 update_note="git pull, then run this installer again."
-[ -z "$PREBUILT" ] || update_note="git pull, build a new binary, then run this installer again with --binary."
+if [ -n "$DOWNLOAD" ]; then
+	update_note="git pull, then run this installer again with --download."
+elif [ -n "$PREBUILT" ]; then
+	update_note="git pull, build a new binary, then run this installer again with --binary."
+fi
 
 tunnel_note="In the Cloudflare dashboard, point the tunnel's public hostname at http://localhost:${LISTEN##*:}."
 [ -n "$TOKEN" ] || tunnel_note="Point your HTTPS reverse proxy for $PUBLIC_URL at http://$LISTEN."
