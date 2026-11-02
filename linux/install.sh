@@ -6,6 +6,11 @@
 #   git clone https://github.com/gganeles/whatsapp-mcp && cd whatsapp-mcp
 #   sudo sh linux/install.sh
 #
+# On a small machine, skip the build by giving it a binary compiled elsewhere (see the
+# README, "Using a prebuilt binary"):
+#
+#   sudo sh linux/install.sh --binary ./whatsapp-mcp-linux-amd64
+#
 # Works with apt (Debian, Ubuntu), dnf/yum (Oracle Linux, RHEL, Rocky, Alma, Fedora,
 # Amazon Linux), zypper (openSUSE, SLES), pacman (Arch) and apk (Alpine), on systemd or
 # OpenRC. It downloads its own Go toolchain, so the distro's Go version doesn't matter.
@@ -18,7 +23,18 @@
 #   WHATSAPP_MCP_HTTP         listen address (default 127.0.0.1:8080)
 #   WHATSAPP_MCP_READ_ONLY    true to disable every tool that sends messages
 #   WHATSAPP_MCP_NONINTERACTIVE=1
+#   WHATSAPP_MCP_BINARY       same as --binary
 set -eu
+
+PREBUILT=${WHATSAPP_MCP_BINARY:-}
+while [ $# -gt 0 ]; do
+	case $1 in
+	--binary) [ $# -ge 2 ] || { echo "--binary needs a path" >&2; exit 2; }; PREBUILT=$2; shift 2 ;;
+	--binary=*) PREBUILT=${1#--binary=}; shift ;;
+	-h | --help) sed -n '2,/^set -eu/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
+	*) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
+	esac
+done
 
 SVC_USER=whatsapp-mcp
 BIN=/usr/local/bin/whatsapp-mcp
@@ -36,6 +52,10 @@ die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "run it as root, e.g. sudo sh $0"
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 [ -f "$REPO/go.mod" ] || die "run it from the whatsapp-mcp repository checkout."
+if [ -n "$PREBUILT" ]; then
+	[ -f "$PREBUILT" ] || die "no such file: $PREBUILT"
+	PREBUILT=$(cd "$(dirname "$PREBUILT")" && pwd)/$(basename "$PREBUILT")
+fi
 
 # Prompts read from the terminal, so they work even when stdin is a pipe.
 INTERACTIVE=1
@@ -85,8 +105,10 @@ pkg_install() {
 say "Installing packages ($PM, $INIT, $GOARCH)"
 need=""
 command -v curl >/dev/null 2>&1 || need="$need curl"
-command -v tar >/dev/null 2>&1 || need="$need tar"
-command -v gzip >/dev/null 2>&1 || need="$need gzip"
+if [ -z "$PREBUILT" ]; then
+	command -v tar >/dev/null 2>&1 || need="$need tar"
+	command -v gzip >/dev/null 2>&1 || need="$need gzip"
+fi
 [ -e /etc/ssl/certs/ca-certificates.crt ] || [ -e /etc/pki/tls/certs/ca-bundle.crt ] ||
 	[ -e /etc/ssl/ca-bundle.pem ] || need="$need ca-certificates"
 if [ "$PM" = apk ]; then
@@ -100,50 +122,61 @@ else
 	echo "nothing to install"
 fi
 
-# ---------------------------------------------------------------- Go toolchain
+# ---------------------------------------------------------------- build (or prebuilt binary)
 
-# version_ge A B: true if version A >= B (both like 1.26.0).
-version_ge() {
-	[ "$(printf '%s\n%s\n' "$2" "$1" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = "$2" ]
-}
-
-GO_NEED=$(sed -n 's/^go \([0-9][0-9.]*\).*/\1/p' "$REPO/go.mod" | head -n1)
-[ -n "$GO_NEED" ] || die "can't read the Go version from go.mod"
-GO=""
-for candidate in "$GO_ROOT/bin/go" "$(command -v go 2>/dev/null || true)" /usr/local/go/bin/go; do
-	[ -n "$candidate" ] && [ -x "$candidate" ] || continue
-	have=$("$candidate" env GOVERSION 2>/dev/null | sed 's/^go//')
-	if [ -n "$have" ] && version_ge "$have" "$GO_NEED"; then
-		GO=$candidate
-		break
+if [ -n "$PREBUILT" ]; then
+	say "Installing the prebuilt binary $PREBUILT"
+	# Copy it next to its final place and run it there, which catches a binary built for
+	# the wrong CPU before it replaces anything (the source may be on a noexec mount).
+	install -m 755 "$PREBUILT" "$BIN.new"
+	if ! "$BIN.new" help >/dev/null 2>&1; then
+		rm -f "$BIN.new"
+		die "$PREBUILT doesn't run here; build it with GOOS=linux GOARCH=$(echo "$GOARCH" | sed 's/armv6l/arm/') (see the README)"
 	fi
-done
+	mv -f "$BIN.new" "$BIN"
+else
+	# Go toolchain: the system's if new enough, otherwise our own copy.
+	# version_ge A B: true if version A >= B (both like 1.26.0).
+	version_ge() {
+		[ "$(printf '%s\n%s\n' "$2" "$1" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = "$2" ]
+	}
 
-if [ -z "$GO" ]; then
-	say "Downloading Go (the server needs Go $GO_NEED or newer)"
-	latest=$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1)
-	case $latest in go1.*) ;; *) die "couldn't look up the latest Go version" ;; esac
-	tmp=$(mktemp -d)
-	trap 'rm -rf "$tmp"' EXIT
-	curl -fSL --progress-bar -o "$tmp/go.tgz" "https://go.dev/dl/$latest.linux-$GOARCH.tar.gz"
-	rm -rf "$GO_ROOT"
-	mkdir -p "$(dirname "$GO_ROOT")"
-	tar -C "$tmp" -xzf "$tmp/go.tgz"
-	mv "$tmp/go" "$GO_ROOT"
-	GO=$GO_ROOT/bin/go
-	echo "installed $latest in $GO_ROOT"
+	GO_NEED=$(sed -n 's/^go \([0-9][0-9.]*\).*/\1/p' "$REPO/go.mod" | head -n1)
+	[ -n "$GO_NEED" ] || die "can't read the Go version from go.mod"
+	GO=""
+	for candidate in "$GO_ROOT/bin/go" "$(command -v go 2>/dev/null || true)" /usr/local/go/bin/go; do
+		[ -n "$candidate" ] && [ -x "$candidate" ] || continue
+		have=$("$candidate" env GOVERSION 2>/dev/null | sed 's/^go//')
+		if [ -n "$have" ] && version_ge "$have" "$GO_NEED"; then
+			GO=$candidate
+			break
+		fi
+	done
+
+	if [ -z "$GO" ]; then
+		say "Downloading Go (the server needs Go $GO_NEED or newer)"
+		latest=$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1)
+		case $latest in go1.*) ;; *) die "couldn't look up the latest Go version" ;; esac
+		tmp=$(mktemp -d)
+		trap 'rm -rf "$tmp"' EXIT
+		curl -fSL --progress-bar -o "$tmp/go.tgz" "https://go.dev/dl/$latest.linux-$GOARCH.tar.gz"
+		rm -rf "$GO_ROOT"
+		mkdir -p "$(dirname "$GO_ROOT")"
+		tar -C "$tmp" -xzf "$tmp/go.tgz"
+		mv "$tmp/go" "$GO_ROOT"
+		GO=$GO_ROOT/bin/go
+		echo "installed $latest in $GO_ROOT"
+	fi
+
+	say "Building whatsapp-mcp with $("$GO" env GOVERSION) (a few minutes the first time)"
+	out=$(mktemp -d)
+	# Pure Go (SQLite included), so no C compiler is needed. -buildvcs=false because the
+	# checkout may belong to another user, which git refuses to read as root.
+	(cd "$REPO" && CGO_ENABLED=0 GOTOOLCHAIN=local "$GO" build -trimpath -buildvcs=false \
+		-ldflags='-s -w' -o "$out/whatsapp-mcp" .)
+	install -m 755 "$out/whatsapp-mcp" "$BIN"
+	rm -rf "$out"
 fi
-
-# ---------------------------------------------------------------- build
-
-say "Building whatsapp-mcp with $("$GO" env GOVERSION) (a few minutes the first time)"
-out=$(mktemp -d)
-# Pure Go (SQLite included), so no C compiler is needed. -buildvcs=false because the
-# checkout may belong to another user, which git refuses to read as root.
-(cd "$REPO" && CGO_ENABLED=0 GOTOOLCHAIN=local "$GO" build -trimpath -buildvcs=false \
-	-ldflags='-s -w' -o "$out/whatsapp-mcp" .)
-install -m 755 "$out/whatsapp-mcp" "$BIN"
-rm -rf "$out"
 mkdir -p "$LIBEXEC"
 install -m 755 "$REPO/linux/whatsapp-mcp-run" "$LIBEXEC/run"
 install -m 755 "$REPO/linux/whatsapp-mcp-admin" /usr/local/sbin/whatsapp-mcp-admin
@@ -341,6 +374,9 @@ if [ "$INIT" != none ]; then
 	fi
 fi
 
+update_note="git pull, then run this installer again."
+[ -z "$PREBUILT" ] || update_note="git pull, build a new binary, then run this installer again with --binary."
+
 tunnel_note="In the Cloudflare dashboard, point the tunnel's public hostname at http://localhost:${LISTEN##*:}."
 [ -n "$TOKEN" ] || tunnel_note="Point your HTTPS reverse proxy for $PUBLIC_URL at http://$LISTEN."
 
@@ -357,5 +393,5 @@ Installed.
   Settings: $CONFIG (restart the service after editing)
   Data:     $DATA_DIR
 
-To update: git pull, then run this installer again.
+To update: $update_note
 DONE

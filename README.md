@@ -91,6 +91,27 @@ Manage accounts with `sudo whatsapp-mcp-admin user add|passwd|remove|list`, and 
 Settings live in `/etc/whatsapp-mcp/env`. To update, `git pull` and run the installer again; it keeps
 your settings.
 
+#### Using a prebuilt binary
+
+Building takes a while on a small VM. The server is pure Go with no C dependencies, so you can
+compile it on any faster computer (Linux, macOS, or Windows with Go 1.26+) for the server's CPU and
+copy it over. Use `amd64` for Intel/AMD servers and `arm64` for ARM ones such as Oracle Cloud's
+Ampere A1 (`uname -m` on the server prints `x86_64` or `aarch64`):
+
+```sh
+# on your computer, in the repository
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o whatsapp-mcp-linux-amd64 .
+scp whatsapp-mcp-linux-amd64 you@server:
+
+# on the server, in the repository
+sudo sh linux/install.sh --binary ~/whatsapp-mcp-linux-amd64
+```
+
+(In Windows PowerShell set the variables with `$env:CGO_ENABLED=0; $env:GOOS="linux"; $env:GOARCH="amd64"` first.)
+The installer then skips downloading Go and building, checks the binary runs on this machine, and
+does the rest as usual. Build the binary from the same version of the repository as the server's
+checkout.
+
 ### On an Android phone (Termux)
 
 You can host the server on the phone itself with [Termux](https://termux.dev), no Docker needed.
