@@ -251,6 +251,12 @@ Each `accounts/<number>/` holds `whatsapp.db` (session keys; treat it like a pas
 `whatsapp-mcp logout` unlinks the device. You can also remove the device from the phone under
 Linked devices.
 
+If the device is removed while the server runs (from the phone, or by WhatsApp itself), the server
+drops the dead session and the tools say so; `get_status` shows `device_removed` with WhatsApp's
+reason. Call `pair_device` to link again, with no restart needed. Stored chats and messages are
+kept. Contacts are part of the WhatsApp session, so `search_contacts` is empty until WhatsApp syncs
+them again after re-linking.
+
 ## Notes
 
 - This uses WhatsApp's multi-device web protocol through an unofficial library. Automated or bulk

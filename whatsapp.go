@@ -25,12 +25,15 @@ import (
 
 // WhatsApp wraps a whatsmeow client and mirrors everything it receives into the MessageStore.
 type WhatsApp struct {
-	Client   *whatsmeow.Client
 	Store    *MessageStore
 	DataDir  string
 	FilesDir string // the only folder file tools may read from or write to
 	Phone    string // the account's number; pairing with any other number is rejected
 	log      waLog.Logger
+
+	container *sqlstore.Container
+	clientMu  sync.RWMutex
+	client    *whatsmeow.Client // replaced with a fresh one when WhatsApp removes the device
 
 	mu        sync.Mutex
 	pairCode  string // phone pairing code while pairing, empty otherwise
@@ -39,6 +42,8 @@ type WhatsApp struct {
 	pairErr   error
 	pairing   bool
 	syncCount int // history sync batches processed since start
+	removed   *deviceRemoval
+	tempBan   string // latest temporary ban notice from WhatsApp, if any
 
 	groupMu    sync.Mutex
 	groupNames map[types.JID]string // known group names; "" means a lookup is pending or failed
@@ -76,7 +81,6 @@ func NewWhatsApp(ctx context.Context, dataDir, phone string, log waLog.Logger) (
 		return nil, fmt.Errorf("failed to open message database: %w", err)
 	}
 	wa := &WhatsApp{
-		Client:   whatsmeow.NewClient(device, log.Sub("Client")),
 		Store:    msgStore,
 		DataDir:  dataDir,
 		FilesDir: filesDir,
@@ -84,10 +88,78 @@ func NewWhatsApp(ctx context.Context, dataDir, phone string, log waLog.Logger) (
 		qrPath:   filepath.Join(dataDir, "login-qr.png"),
 		log:      log,
 
+		container:  container,
 		groupNames: make(map[types.JID]string),
 	}
-	wa.Client.AddEventHandler(wa.handleEvent)
+	wa.client = wa.newClient(device)
 	return wa, nil
+}
+
+// deviceRemoval records that WhatsApp unlinked this device while the server was running.
+type deviceRemoval struct {
+	Reason string
+	At     time.Time
+}
+
+func (wa *WhatsApp) newClient(device *store.Device) *whatsmeow.Client {
+	c := whatsmeow.NewClient(device, wa.log.Sub("Client"))
+	c.AddEventHandler(func(evt any) { wa.handleEvent(c, evt) })
+	return c
+}
+
+// Client returns the current whatsmeow client. Don't keep it around: it is replaced
+// when WhatsApp removes the linked device, because whatsmeow can't reuse a deleted device.
+func (wa *WhatsApp) Client() *whatsmeow.Client {
+	wa.clientMu.RLock()
+	defer wa.clientMu.RUnlock()
+	return wa.client
+}
+
+// resetDevice replaces the client stale with one holding a brand new, unpaired device,
+// so pairing can start over. whatsmeow deletes a device's keys, sessions and contacts when
+// it is logged out and then refuses every call on it with store.ErrDeviceDeleted, so the
+// old device can't be paired again. The message database is separate and is kept.
+// Nothing happens if stale was already replaced.
+func (wa *WhatsApp) resetDevice(stale *whatsmeow.Client) {
+	wa.clientMu.Lock()
+	old := wa.client
+	if old != stale {
+		wa.clientMu.Unlock()
+		return
+	}
+	wa.client = wa.newClient(wa.container.NewDevice())
+	wa.clientMu.Unlock()
+
+	old.RemoveEventHandlers()
+	old.Disconnect()
+	wa.groupMu.Lock()
+	wa.groupNames = make(map[types.JID]string)
+	wa.groupMu.Unlock()
+	wa.log.Infof("Started a fresh device; call pair_device to link the account again")
+}
+
+// Removal reports whether WhatsApp removed this device since the server started.
+func (wa *WhatsApp) Removal() *deviceRemoval {
+	wa.mu.Lock()
+	defer wa.mu.Unlock()
+	return wa.removed
+}
+
+// TempBan returns the latest temporary ban notice from WhatsApp, if any.
+func (wa *WhatsApp) TempBan() string {
+	wa.mu.Lock()
+	defer wa.mu.Unlock()
+	return wa.tempBan
+}
+
+// NotLinkedError explains why the tools can't use WhatsApp right now.
+func (wa *WhatsApp) NotLinkedError() error {
+	if r := wa.Removal(); r != nil {
+		return fmt.Errorf("WhatsApp removed this linked device at %s (reason: %s). "+
+			"Call pair_device to link it again; stored chats and messages are kept",
+			r.At.Format(time.RFC3339), r.Reason)
+	}
+	return errors.New("WhatsApp isn't linked yet. Use pair_device to link it")
 }
 
 // Connect connects to WhatsApp using the stored session. It fails if the device isn't paired yet.
@@ -95,7 +167,7 @@ func (wa *WhatsApp) Connect() error {
 	if !wa.LoggedIn() {
 		return errors.New("not paired with a phone yet")
 	}
-	return wa.Client.Connect()
+	return wa.Client().Connect()
 }
 
 // StartPairing links this device to a WhatsApp account. With a phone number (international
@@ -108,6 +180,10 @@ func (wa *WhatsApp) StartPairing(ctx context.Context, phone string, onQR func(co
 	if wa.LoggedIn() {
 		return "", errors.New("already paired; log out first to link a different account")
 	}
+	// A device WhatsApp removed (or a failed pairing) can't be paired again; start fresh.
+	if c := wa.Client(); c.Store.Deleted {
+		wa.resetDevice(c)
+	}
 	wa.mu.Lock()
 	if wa.pairing {
 		code := wa.pairCode
@@ -119,7 +195,7 @@ func (wa *WhatsApp) StartPairing(ctx context.Context, phone string, onQR func(co
 			return "", nil
 		}
 		// A QR-only pairing is running; restart it so we can request a code.
-		wa.Client.Disconnect()
+		wa.Client().Disconnect()
 		wa.waitPairingDone(5 * time.Second)
 		wa.mu.Lock()
 	}
@@ -137,11 +213,11 @@ func (wa *WhatsApp) StartPairing(ctx context.Context, phone string, onQR func(co
 	}
 	// The QR channel needs a context that outlives this call; the channel closes by itself
 	// when pairing succeeds or times out.
-	qrChan, err := wa.Client.GetQRChannel(context.Background())
+	qrChan, err := wa.Client().GetQRChannel(context.Background())
 	if err != nil {
 		return fail(err)
 	}
-	if err = wa.Client.Connect(); err != nil {
+	if err = wa.Client().Connect(); err != nil {
 		return fail(err)
 	}
 	ready := make(chan struct{})
@@ -157,7 +233,7 @@ func (wa *WhatsApp) StartPairing(ctx context.Context, phone string, onQR func(co
 	if phone == "" {
 		return "", nil
 	}
-	code, err := wa.Client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	code, err := wa.Client().PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
 		wa.mu.Lock()
 		wa.pairErr = fmt.Errorf("failed to request pairing code: %w", err)
@@ -181,7 +257,7 @@ func (wa *WhatsApp) consumeQR(qrChan <-chan whatsmeow.QRChannelItem, ready chan 
 		case whatsmeow.QRChannelSuccess.Event:
 			wa.qrCode, wa.pairCode = "", ""
 			_ = os.Remove(wa.qrPath)
-			if id := wa.Client.Store.ID; id != nil && wa.Phone != "" && id.User != wa.Phone {
+			if id := wa.Client().Store.ID; id != nil && wa.Phone != "" && id.User != wa.Phone {
 				// Someone linked a different WhatsApp account than this one belongs to.
 				wa.pairErr = fmt.Errorf("the phone that was linked is +%s, but this account is +%s; it has been unlinked", id.User, wa.Phone)
 				wa.log.Warnf("%v", wa.pairErr)
@@ -217,17 +293,17 @@ func (wa *WhatsApp) consumeQR(qrChan <-chan whatsmeow.QRChannelItem, ready chan 
 func (wa *WhatsApp) unlinkWrongNumber() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	for !wa.Client.IsLoggedIn() && ctx.Err() == nil {
+	for !wa.Client().IsLoggedIn() && ctx.Err() == nil {
 		time.Sleep(200 * time.Millisecond)
 	}
-	if err := wa.Client.Logout(ctx); err != nil {
-		wa.Client.Disconnect()
-		_ = wa.Client.Store.Delete(ctx)
+	if err := wa.Client().Logout(ctx); err != nil {
+		wa.Client().Disconnect()
+		_ = wa.Client().Store.Delete(ctx)
 	}
 }
 
 func (wa *WhatsApp) LoggedIn() bool {
-	return wa.Client.Store.ID != nil && (wa.Phone == "" || wa.Client.Store.ID.User == wa.Phone)
+	return wa.Client().Store.ID != nil && (wa.Phone == "" || wa.Client().Store.ID.User == wa.Phone)
 }
 
 func (wa *WhatsApp) waitPairingDone(timeout time.Duration) {
@@ -278,11 +354,12 @@ func (wa *WhatsApp) SyncCount() int {
 }
 
 func (wa *WhatsApp) Close() {
-	wa.Client.Disconnect()
+	wa.Client().Disconnect()
 	_ = wa.Store.Close()
 }
 
-func (wa *WhatsApp) handleEvent(rawEvt any) {
+// handleEvent handles an event from client c, which may already have been replaced.
+func (wa *WhatsApp) handleEvent(c *whatsmeow.Client, rawEvt any) {
 	ctx := context.Background()
 	switch evt := rawEvt.(type) {
 	case *events.Message:
@@ -300,12 +377,26 @@ func (wa *WhatsApp) handleEvent(rawEvt any) {
 		wa.setGroupName(ctx, evt.JID, evt.GroupName.Name)
 	case *events.LoggedOut:
 		wa.log.Warnf("Logged out from WhatsApp (reason: %s); link the account again with pair_device or the login command", evt.Reason)
+		wa.mu.Lock()
+		wa.removed = &deviceRemoval{Reason: evt.Reason.String(), At: time.Now()}
+		wa.mu.Unlock()
+		// Runs separately: whatsmeow is still dispatching this event and deleting the device.
+		go wa.resetDevice(c)
+	case *events.TemporaryBan:
+		wa.log.Warnf("WhatsApp temporarily banned this account: %s", evt)
+		wa.mu.Lock()
+		wa.tempBan = evt.String()
+		wa.mu.Unlock()
+	case *events.PairSuccess:
+		wa.mu.Lock()
+		wa.removed, wa.tempBan = nil, ""
+		wa.mu.Unlock()
 	}
 }
 
 // refreshGroups fetches the names of all joined groups, since messages don't carry them.
 func (wa *WhatsApp) refreshGroups(ctx context.Context) {
-	groups, err := wa.Client.GetJoinedGroups(ctx)
+	groups, err := wa.Client().GetJoinedGroups(ctx)
 	if err != nil {
 		wa.log.Warnf("Failed to fetch joined groups: %v", err)
 		return
@@ -326,7 +417,7 @@ func (wa *WhatsApp) setGroupName(ctx context.Context, jid types.JID, name string
 // known, so the same person doesn't show up as two different chats.
 func (wa *WhatsApp) normalizeJID(ctx context.Context, jid types.JID) types.JID {
 	if jid.Server == types.HiddenUserServer {
-		if pn, err := wa.Client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+		if pn, err := wa.Client().Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
 			return pn.ToNonAD()
 		}
 	}
@@ -336,7 +427,7 @@ func (wa *WhatsApp) normalizeJID(ctx context.Context, jid types.JID) types.JID {
 // ContactName returns the best known display name for a user JID.
 func (wa *WhatsApp) ContactName(ctx context.Context, jid types.JID) string {
 	for _, candidate := range []types.JID{jid.ToNonAD(), wa.normalizeJID(ctx, jid)} {
-		info, err := wa.Client.Store.Contacts.GetContact(ctx, candidate)
+		info, err := wa.Client().Store.Contacts.GetContact(ctx, candidate)
 		if err != nil || !info.Found {
 			continue
 		}
@@ -376,9 +467,9 @@ func (wa *WhatsApp) chatName(ctx context.Context, st *MessageStore, chat types.J
 		wa.groupMu.Unlock()
 		return name
 	}
-	if wa.Client.IsConnected() {
+	if wa.Client().IsConnected() {
 		go func() {
-			if info, err := wa.Client.GetGroupInfo(context.Background(), chat); err == nil {
+			if info, err := wa.Client().GetGroupInfo(context.Background(), chat); err == nil {
 				wa.setGroupName(context.Background(), chat, info.Name)
 			}
 		}()
@@ -465,7 +556,7 @@ func (wa *WhatsApp) storeHistorySync(ctx context.Context, data *waHistorySync.Hi
 				return err
 			}
 			for _, hm := range conv.GetMessages() {
-				evt, err := wa.Client.ParseWebMessage(chatJID, hm.GetMessage())
+				evt, err := wa.Client().ParseWebMessage(chatJID, hm.GetMessage())
 				if err != nil {
 					continue
 				}
@@ -611,7 +702,7 @@ func (wa *WhatsApp) RequestHistory(ctx context.Context, chat types.JID, count in
 		ID:            oldest.ID,
 		Timestamp:     oldest.Timestamp,
 	}
-	_, err = wa.Client.SendPeerMessage(ctx, wa.Client.BuildHistorySyncRequest(info, count))
+	_, err = wa.Client().SendPeerMessage(ctx, wa.Client().BuildHistorySyncRequest(info, count))
 	return err
 }
 
@@ -625,7 +716,7 @@ func (wa *WhatsApp) recordSent(ctx context.Context, to types.JID, id types.Messa
 	m.ID = id
 	m.FromMe = true
 	m.SenderName = "me"
-	if own := wa.Client.Store.ID; own != nil {
+	if own := wa.Client().Store.ID; own != nil {
 		m.SenderJID = own.ToNonAD().String()
 	}
 	m.Timestamp = ts
