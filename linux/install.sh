@@ -16,7 +16,8 @@
 # Amazon Linux), zypper (openSUSE, SLES), pacman (Arch) and apk (Alpine), on systemd or
 # OpenRC. It downloads its own Go toolchain, so the distro's Go version doesn't matter.
 #
-# It is safe to run again: to update, `git pull` and rerun it. Saved settings are kept.
+# It is safe to run again: to update, `git pull` and rerun it. Saved settings, accounts,
+# passwords and signed-in clients are all kept, so nobody has to sign in again.
 #
 # To run without prompts, set any of these in the environment first:
 #   WHATSAPP_MCP_PUBLIC_URL   the public https:// address of the server
@@ -341,10 +342,19 @@ fi
 if [ "$INTERACTIVE" = 1 ]; then
 	say "Accounts"
 	"$ADMIN" user list || true
-	printf 'Add an account now? Enter its WhatsApp number (e.g. +14155551234), or press Enter to skip: ' >/dev/tty
+	# Accounts, passwords and sign-ins live in $DATA_DIR/auth.db, which reinstalling never
+	# touches, so an update needs no account step at all.
+	if "$ADMIN" user list 2>/dev/null | grep -q '^+'; then
+		echo "These accounts, their passwords and their signed-in clients are kept as they are."
+		printf 'Add another account? Enter its WhatsApp number, or press Enter to skip: ' >/dev/tty
+	else
+		printf 'Add an account now? Enter its WhatsApp number (e.g. +14155551234), or press Enter to skip: ' >/dev/tty
+	fi
 	IFS= read -r phone </dev/tty || phone=""
 	if [ -n "$phone" ]; then
-		"$ADMIN" user add "$phone" </dev/tty
+		# A failure here (say, a number that already has an account) mustn't stop the
+		# update half way, before the new binary is running.
+		"$ADMIN" user add "$phone" </dev/tty || echo "No account added; carrying on." >&2
 	fi
 fi
 
@@ -417,11 +427,13 @@ tunnel_note="In the Cloudflare dashboard, point the tunnel's public hostname at 
 
 cat <<DONE
 
-Installed.
+Installed. Existing accounts, passwords and connector sign-ins were kept; nobody needs to
+sign in again.
 
   1. $tunnel_note
-  2. In claude.ai: Settings > Connectors > Add custom connector > $PUBLIC_URL/mcp,
-     sign in with your number and password, then ask Claude to "link my WhatsApp".
+  2. New users only: in claude.ai, Settings > Connectors > Add custom connector >
+     $PUBLIC_URL/mcp, sign in with your number and password, then ask Claude to
+     "link my WhatsApp".
 
   Accounts: sudo whatsapp-mcp-admin user add|passwd|remove|list
   Service:  $MANAGE
