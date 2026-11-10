@@ -237,7 +237,7 @@ func (m *AccountManager) Reconcile(ctx context.Context) {
 			if _, err := m.store.PasswordHash(ctx, id); errors.Is(err, ErrNoAccount) {
 				m.log.Infof("Account +%s was removed; unlinking and stopping it", id)
 				if rt.wa.LoggedIn() {
-					_ = rt.wa.Client.Logout(ctx)
+					_ = rt.wa.Client().Logout(ctx)
 				}
 				rt.wa.Close()
 				delete(m.running, id)

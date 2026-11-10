@@ -19,6 +19,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
@@ -185,9 +186,9 @@ type tools struct {
 
 func (t *tools) requireConnected() error {
 	if !t.wa.LoggedIn() {
-		return errors.New("WhatsApp isn't linked yet. Use pair_device to link it")
+		return t.wa.NotLinkedError()
 	}
-	if !t.wa.Client.IsConnected() {
+	if !t.wa.Client().IsConnected() {
 		return errors.New("not connected to WhatsApp right now; try again in a moment")
 	}
 	return nil
@@ -202,6 +203,11 @@ func jsonResult(v any) (*mcp.CallToolResult, error) {
 }
 
 func errResult(err error) (*mcp.CallToolResult, error) {
+	if errors.Is(err, store.ErrDeviceDeleted) {
+		// whatsmeow's own wording ("invalid use of deleted device") doesn't say what to do.
+		err = errors.New("WhatsApp removed this linked device, so the session is gone. " +
+			"Call pair_device to link it again; stored chats and messages are kept")
+	}
 	return mcp.NewToolResultError(err.Error()), nil
 }
 
@@ -277,15 +283,15 @@ func (t *tools) getStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 	}
 	status := map[string]any{
 		"linked":               t.wa.LoggedIn(),
-		"connected":            t.wa.Client.IsConnected(),
+		"connected":            t.wa.Client().IsConnected(),
 		"stored_chats":         chats,
 		"stored_messages":      msgs,
 		"history_sync_batches": t.wa.SyncCount(),
 		"account":              "+" + t.wa.Phone,
 	}
-	if id := t.wa.Client.Store.ID; id != nil {
+	if id := t.wa.Client().Store.ID; id != nil {
 		status["linked_number"] = "+" + id.User
-		status["push_name"] = t.wa.Client.Store.PushName
+		status["push_name"] = t.wa.Client().Store.PushName
 	}
 	pairCode, qr, qrPath, pairing, pairErr := t.wa.PairingState()
 	if pairing {
@@ -300,15 +306,27 @@ func (t *tools) getStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 	if pairErr != nil && !t.wa.LoggedIn() {
 		status["last_pairing_error"] = pairErr.Error()
 	}
-	if !t.wa.LoggedIn() && !pairing {
-		status["hint"] = "Not linked. Call pair_device to get a pairing code."
+	if ban := t.wa.TempBan(); ban != "" {
+		status["temporary_ban"] = ban
+	}
+	if !t.wa.LoggedIn() {
+		if r := t.wa.Removal(); r != nil {
+			status["device_removed"] = map[string]any{"reason": r.Reason, "at": r.At.Format(time.RFC3339)}
+		}
+		if !pairing {
+			if t.wa.Removal() != nil {
+				status["hint"] = "WhatsApp removed this linked device. Call pair_device to link it again; stored chats and messages are kept."
+			} else {
+				status["hint"] = "Not linked. Call pair_device to get a pairing code."
+			}
+		}
 	}
 	return jsonResult(status)
 }
 
 func (t *tools) pairDevice(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if t.wa.LoggedIn() {
-		return mcp.NewToolResultText("Already linked to +" + t.wa.Client.Store.ID.User + "."), nil
+		return mcp.NewToolResultText("Already linked to +" + t.wa.Client().Store.ID.User + "."), nil
 	}
 	useQR := req.GetBool("use_qr", false)
 	phone := t.wa.Phone
@@ -366,7 +384,7 @@ func (t *tools) getChat(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 		out["stored_messages"], _ = t.wa.Store.CountMessages(ctx, jid.String())
 	}
 	if jid.Server == types.GroupServer && t.requireConnected() == nil {
-		info, err := t.wa.Client.GetGroupInfo(ctx, jid)
+		info, err := t.wa.Client().GetGroupInfo(ctx, jid)
 		if err != nil {
 			out["group_info_error"] = err.Error()
 		} else {
@@ -514,7 +532,11 @@ func (t *tools) searchContacts(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 	var out []contact
 	seen := map[string]bool{}
-	contacts, err := t.wa.Client.Store.Contacts.GetAllContacts(ctx)
+	if !t.wa.LoggedIn() {
+		// Contacts live with the linked device and are deleted along with it.
+		return errResult(t.wa.NotLinkedError())
+	}
+	contacts, err := t.wa.Client().Store.Contacts.GetAllContacts(ctx)
 	if err != nil {
 		return errResult(err)
 	}
@@ -612,7 +634,7 @@ func (t *tools) quoteContext(ctx context.Context, chat types.JID, id string) (*w
 }
 
 func (t *tools) send(ctx context.Context, to types.JID, msg *waE2E.Message) (*mcp.CallToolResult, error) {
-	resp, err := t.wa.Client.SendMessage(ctx, to, msg)
+	resp, err := t.wa.Client().SendMessage(ctx, to, msg)
 	if err != nil {
 		return errResult(fmt.Errorf("failed to send: %w", err))
 	}
@@ -661,7 +683,7 @@ func (t *tools) sendFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if mediaType == "" {
 		return errResult(fmt.Errorf("unknown media kind %q", kind))
 	}
-	up, err := t.wa.Client.Upload(ctx, data, mediaType)
+	up, err := t.wa.Client().Upload(ctx, data, mediaType)
 	if err != nil {
 		return errResult(fmt.Errorf("upload failed: %w", err))
 	}
@@ -720,8 +742,8 @@ func (t *tools) sendReaction(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	if msg.FromMe {
 		sender = types.EmptyJID
 	}
-	reaction := t.wa.Client.BuildReaction(chat, sender, msg.ID, req.GetString("emoji", ""))
-	resp, err := t.wa.Client.SendMessage(ctx, chat, reaction)
+	reaction := t.wa.Client().BuildReaction(chat, sender, msg.ID, req.GetString("emoji", ""))
+	resp, err := t.wa.Client().SendMessage(ctx, chat, reaction)
 	if err != nil {
 		return errResult(fmt.Errorf("failed to react: %w", err))
 	}
@@ -743,7 +765,7 @@ func (t *tools) downloadMedia(ctx context.Context, req mcp.CallToolRequest) (*mc
 	if err = proto.Unmarshal(msg.Raw, &waMsg); err != nil {
 		return errResult(err)
 	}
-	data, err := t.wa.Client.DownloadAny(ctx, &waMsg)
+	data, err := t.wa.Client().DownloadAny(ctx, &waMsg)
 	if err != nil {
 		return errResult(fmt.Errorf("download failed (old media may have expired on WhatsApp's servers): %w", err))
 	}

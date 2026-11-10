@@ -493,7 +493,7 @@ func runLogout(ctx context.Context, cfg config, log waLog.Logger) error {
 	if err = wa.Connect(); err != nil {
 		return err
 	}
-	if err = wa.Client.Logout(ctx); err != nil {
+	if err = wa.Client().Logout(ctx); err != nil {
 		return err
 	}
 	fmt.Printf("+%s logged out. Its stored messages are kept in %s.\n", id, AccountDir(cfg.dataDir, id))
