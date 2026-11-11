@@ -119,9 +119,13 @@ func main() {
 	case "logout":
 		err = runLogout(ctx, cfg, log)
 	case "user":
-		err = runUser(ctx, cfg, positional)
+		if err = checkServiceDataDir(fs); err == nil {
+			err = runUser(ctx, cfg, positional)
+		}
 	case "revoke-tokens":
-		err = runRevokeTokens(ctx, cfg)
+		if err = checkServiceDataDir(fs); err == nil {
+			err = runRevokeTokens(ctx, cfg)
+		}
 	case "healthcheck":
 		err = runHealthcheck(cfg.httpAddr)
 	case "help", "-h", "--help":
@@ -134,6 +138,29 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
+}
+
+// serviceEnvFile exists when linux/install.sh set up the server as a system service.
+const serviceEnvFile = "/etc/whatsapp-mcp/env"
+
+// checkServiceDataDir stops account commands from quietly editing ~/.whatsapp-mcp on a
+// machine where the real server, installed by linux/install.sh, keeps its accounts in
+// /var/lib/whatsapp-mcp. whatsapp-mcp-admin sets WHATSAPP_MCP_DATA, so it passes.
+func checkServiceDataDir(fs *flag.FlagSet) error {
+	if os.Getenv("WHATSAPP_MCP_DATA") != "" {
+		return nil
+	}
+	explicit := false
+	fs.Visit(func(f *flag.Flag) { explicit = explicit || f.Name == "data" })
+	if explicit {
+		return nil
+	}
+	if _, err := os.Stat(serviceEnvFile); err != nil {
+		return nil
+	}
+	return errors.New("this machine runs whatsapp-mcp as a service, whose accounts this command can't see.\n" +
+		"Use: sudo whatsapp-mcp-admin " + strings.Join(os.Args[1:], " ") + "\n" +
+		"(or pass --data DIR to manage a separate data directory on purpose)")
 }
 
 func defaultDataDir() string {
@@ -372,6 +399,18 @@ func readNewPassword() (password string, generated bool, err error) {
 			return "", false, err
 		}
 		password = string(raw)
+		// Typed blind, so ask twice: a typo here means a password nobody knows.
+		if password != "" {
+			fmt.Print("Type it again: ")
+			again, err := term.ReadPassword(int(os.Stdin.Fd()))
+			fmt.Println()
+			if err != nil {
+				return "", false, err
+			}
+			if string(again) != password {
+				return "", false, errors.New("the passwords don't match; nothing was changed")
+			}
+		}
 	} else {
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		password = strings.TrimSpace(line)
