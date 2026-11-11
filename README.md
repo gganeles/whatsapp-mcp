@@ -66,6 +66,10 @@ sleep) with Docker, and a domain on Cloudflare. The tunnel gives you HTTPS witho
 
 To use it from Claude Code too: `claude mcp add --transport http whatsapp https://whatsapp.example.com/mcp`.
 
+To update, `git pull` and run `docker compose up -d --build`. Accounts, passwords, connector
+sign-ins and the WhatsApp link all live in the `whatsapp-data` volume, which a rebuild keeps, so
+nobody has to sign in again (see [Updating keeps everyone signed in](#updating-keeps-everyone-signed-in)).
+
 ### On a Linux server without Docker
 
 `linux/install.sh` installs the server natively on any Linux: Oracle Linux, RHEL, Rocky, Alma,
@@ -89,7 +93,8 @@ tunnel.
 Manage accounts with `sudo whatsapp-mcp-admin user add|passwd|remove|list`, and the services with
 `systemctl status|restart whatsapp-mcp whatsapp-mcp-tunnel` (logs: `journalctl -u whatsapp-mcp -f`).
 Settings live in `/etc/whatsapp-mcp/env`. To update, `git pull` and run the installer again; it keeps
-your settings.
+your settings, accounts and passwords, and everyone stays signed in. Press Enter at its account
+prompt: there's no need to add existing accounts again.
 
 #### Using a prebuilt binary
 
@@ -244,6 +249,30 @@ Every flag can also be set by environment variable.
 Data directory layout: `auth.db` holds accounts (hashed passwords), OAuth clients and hashed tokens.
 Each `accounts/<number>/` holds `whatsapp.db` (session keys; treat it like a password),
 `messages.db` (messages with a full-text index) and `files/`.
+
+## Updating keeps everyone signed in
+
+The server has no signing key or secret that changes between builds. Everything that keeps a
+connector signed in is a row in `auth.db` in the data directory: the hashed passwords, the
+registered OAuth clients and the hashed access and refresh tokens. A new binary or image reads the
+same rows, so a client signed in before the update keeps working after it, and its refresh token
+keeps renewing for 90 days of inactivity. Updating needs no `user add` or `user passwd`.
+
+Everyone has to sign in again only when one of these happens:
+
+- **`user passwd`**, `user remove` or `revoke-tokens`. These sign the account's clients out on
+  purpose. Don't use them as part of an update. `user add` for a number that already has an account
+  is refused and changes nothing.
+- **The data directory is lost.** With Docker, `docker compose down -v`, `docker volume rm` or
+  `docker volume prune` deletes the `whatsapp-data` volume; plain `docker compose down` and
+  `up --build` keep it. A `docker run` without `-v whatsapp-data:/data` starts from an empty
+  `/data` each time. On Linux, the installer never touches `/var/lib/whatsapp-mcp`; only deleting it,
+  or rebuilding the VM without its disk, loses it. Back up the data directory to keep accounts across
+  a move to a new machine.
+- **The public URL changes.** Tokens are issued for `WHATSAPP_MCP_PUBLIC_URL`/mcp, and the connector
+  in Claude points at that address, so a new hostname means a new connector.
+- **`user add` without `whatsapp-mcp-admin`** on an installed Linux server writes to
+  `~/.whatsapp-mcp`, which the service never reads. Use `sudo whatsapp-mcp-admin user …`.
 
 ## Unlink
 

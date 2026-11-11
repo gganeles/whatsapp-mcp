@@ -308,6 +308,14 @@ func runUser(ctx context.Context, cfg config, args []string) error {
 	}
 	switch action {
 	case "add":
+		// Check first, so rerunning an installer or a setup script with the same number
+		// doesn't ask for a password it would then throw away.
+		if _, err := store.PasswordHash(ctx, id); err == nil {
+			return fmt.Errorf("+%s already has an account; its password and signed-in clients are unchanged "+
+				"(to set a new password, which signs its clients out, use: user passwd +%s)", id, id)
+		} else if !errors.Is(err, ErrNoAccount) {
+			return err
+		}
 		password, generated, err := readNewPassword()
 		if err != nil {
 			return err

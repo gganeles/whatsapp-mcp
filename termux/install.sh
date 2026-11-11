@@ -59,9 +59,14 @@ chmod 600 "$CONFIG"
 echo
 echo "==> Accounts"
 whatsapp-mcp user list
-read -r -p "Add an account now? Enter its WhatsApp number (e.g. +972501234567), or press Enter to skip: " phone
+if whatsapp-mcp user list 2>/dev/null | grep -q '^+'; then
+	echo "These accounts, their passwords and their signed-in clients are kept as they are."
+	read -r -p "Add another account? Enter its WhatsApp number, or press Enter to skip: " phone
+else
+	read -r -p "Add an account now? Enter its WhatsApp number (e.g. +972501234567), or press Enter to skip: " phone
+fi
 if [ -n "$phone" ]; then
-	whatsapp-mcp user add "$phone"
+	whatsapp-mcp user add "$phone" || echo "No account added; carrying on." >&2
 fi
 
 echo
