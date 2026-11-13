@@ -435,7 +435,7 @@ sign in again.
      $PUBLIC_URL/mcp, sign in with your number and password, then ask Claude to
      "link my WhatsApp".
 
-  Accounts: sudo whatsapp-mcp-admin user add|passwd|remove|list
+  Accounts: sudo whatsapp-mcp-admin user add|passwd|check|remove|list
   Service:  $MANAGE
   Settings: $CONFIG (restart the service after editing)
   Data:     $DATA_DIR

@@ -90,7 +90,7 @@ as its own `whatsapp-mcp` user, listens only on `127.0.0.1:8080`, and keeps its 
 `/var/lib/whatsapp-mcp`. Leave the token empty to use your own HTTPS reverse proxy instead of a
 tunnel.
 
-Manage accounts with `sudo whatsapp-mcp-admin user add|passwd|remove|list`, and the services with
+Manage accounts with `sudo whatsapp-mcp-admin user add|passwd|check|remove|list`, and the services with
 `systemctl status|restart whatsapp-mcp whatsapp-mcp-tunnel` (logs: `journalctl -u whatsapp-mcp -f`).
 Settings live in `/etc/whatsapp-mcp/env`. To update, `git pull` and run the installer again; it keeps
 your settings, accounts and passwords, and everyone stays signed in. Press Enter at its account

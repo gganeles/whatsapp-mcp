@@ -38,7 +38,7 @@ type AuthServer struct {
 	redirects RedirectPolicy
 	limiter   *loginLimiter
 
-	// Log receives token endpoint failures. Nil means don't log.
+	// Log receives sign-in and token endpoint events. Nil means don't log.
 	Log waLog.Logger
 
 	mu      sync.Mutex
@@ -420,10 +420,12 @@ func (a *AuthServer) authorizeSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	account, err := NormalizePhone(r.PostForm.Get("phone"))
 	if err != nil {
+		a.warnf("Sign-in rejected: the phone number entered isn't in international format")
 		a.renderConsent(w, r, http.StatusBadRequest, id, p, "Enter your WhatsApp number in international format, e.g. +14155551234.")
 		return
 	}
 	if wait := a.limiter.blockedFor(account); wait > 0 {
+		a.warnf("Sign-in rejected for +%s: locked out for %s after too many failures", account, wait.Round(time.Second))
 		a.renderConsent(w, r, http.StatusTooManyRequests, id, p,
 			fmt.Sprintf("Too many failed sign-ins. Try again in %d minutes.", int(wait.Minutes())+1))
 		return
@@ -433,6 +435,14 @@ func (a *AuthServer) authorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		hash = dummyHash
 	}
 	if bcrypt.CompareHashAndPassword(hash, []byte(r.PostForm.Get("password"))) != nil || err != nil {
+		switch {
+		case errors.Is(err, ErrNoAccount):
+			a.warnf("Sign-in failed for +%s: no account with that number (see `user list`)", account)
+		case err != nil:
+			a.warnf("Sign-in failed for +%s: couldn't read the account: %v", account, err)
+		default:
+			a.warnf("Sign-in failed for +%s: wrong password", account)
+		}
 		a.limiter.fail(account)
 		a.renderConsent(w, r, http.StatusUnauthorized, id, p, "Wrong phone number or password.")
 		return
@@ -444,9 +454,11 @@ func (a *AuthServer) authorizeSubmit(w http.ResponseWriter, r *http.Request) {
 	if _, err := a.db.ExecContext(r.Context(), `INSERT INTO oauth_codes (code_hash, account_id, client_id, redirect_uri, code_challenge, scope, resource, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, hashSecret(code), account, p.clientID, p.redirectURI, p.challenge, p.scope, p.resource,
 		time.Now().Add(authCodeTTL).Unix()); err != nil {
+		a.warnf("Sign-in for +%s couldn't be completed: %v", account, err)
 		renderMessage(w, http.StatusInternalServerError, "Server error", "Couldn't complete sign-in.")
 		return
 	}
+	a.infof("Signed in +%s; sending the client back to %s", account, p.redirectURI)
 	redirectWithParams(w, r, p.redirectURI, url.Values{"code": {code}, "state": {p.state}, "iss": {a.base.String()}})
 }
 
@@ -482,21 +494,26 @@ func (a *AuthServer) exchangeCode(w http.ResponseWriter, r *http.Request, f url.
 		RETURNING account_id, client_id, redirect_uri, code_challenge, scope, resource, expires_at`, hashSecret(f.Get("code"))).
 		Scan(&account, &clientID, &redirectURI, &challenge, &scope, &resource, &expires)
 	if err != nil || time.Now().Unix() > expires {
+		a.warnf("Code exchange rejected: invalid or expired authorization code")
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired authorization code")
 		return
 	}
 	if f.Get("client_id") != clientID || f.Get("redirect_uri") != redirectURI {
+		a.warnf("Code exchange rejected for +%s: client_id or redirect_uri doesn't match the sign-in", account)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "client_id or redirect_uri doesn't match the authorization request")
 		return
 	}
 	if res := f.Get("resource"); res != "" && !a.validResource(res) {
+		a.warnf("Code exchange rejected for +%s: unknown resource %q (expected %s)", account, res, a.ResourceURL())
 		oauthError(w, http.StatusBadRequest, "invalid_target", "unknown resource")
 		return
 	}
 	if !verifyPKCE(f.Get("code_verifier"), challenge) {
+		a.warnf("Code exchange rejected for +%s: PKCE verification failed", account)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "PKCE verification failed")
 		return
 	}
+	a.infof("Issued tokens to +%s", account)
 	a.issueTokens(w, r, account, clientID, scope, resource)
 }
 
@@ -587,6 +604,12 @@ func insertTokenPair(tx *sql.Tx, now time.Time, account, clientID, scope, resour
 func temporaryError(w http.ResponseWriter) {
 	w.Header().Set("Retry-After", "5")
 	oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "the server couldn't handle the request, try again")
+}
+
+func (a *AuthServer) infof(format string, args ...any) {
+	if a.Log != nil {
+		a.Log.Infof(format, args...)
+	}
 }
 
 func (a *AuthServer) warnf(format string, args ...any) {

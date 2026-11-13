@@ -22,6 +22,7 @@ import (
 	"github.com/mdp/qrterminal/v3"
 	"github.com/rs/zerolog"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/term"
 )
 
@@ -301,7 +302,7 @@ func runHealthcheck(addr string) error {
 
 func runUser(ctx context.Context, cfg config, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: whatsapp-mcp user add|passwd|remove|list [+number]")
+		return errors.New("usage: whatsapp-mcp user add|passwd|check|remove|list [+number]")
 	}
 	store, err := OpenAccountStore(cfg.dataDir)
 	if err != nil {
@@ -371,6 +372,23 @@ func runUser(ctx context.Context, cfg config, args []string) error {
 			fmt.Printf("Password for +%s: %s\n", id, password)
 		}
 		fmt.Println("Password changed; the account's clients were signed out.")
+	case "check":
+		// Verifies a password against the same database the server signs in with, so a
+		// failing sign-in can be narrowed to the number, the password or the client.
+		hash, err := store.PasswordHash(ctx, id)
+		if errors.Is(err, ErrNoAccount) {
+			return fmt.Errorf("no account +%s in %s (see: user list)", id, cfg.dataDir)
+		} else if err != nil {
+			return err
+		}
+		password, err := readPassword()
+		if err != nil {
+			return err
+		}
+		if bcrypt.CompareHashAndPassword(hash, []byte(password)) != nil {
+			return fmt.Errorf("wrong password for +%s", id)
+		}
+		fmt.Printf("Password is correct for +%s.\n", id)
 	case "remove":
 		if err = store.RemoveAccount(ctx, id); err != nil {
 			return err
@@ -388,6 +406,19 @@ func runUser(ctx context.Context, cfg config, args []string) error {
 		return fmt.Errorf("unknown user action %q", action)
 	}
 	return nil
+}
+
+// readPassword reads one password from the terminal without echoing it, or a line from stdin.
+func readPassword() (string, error) {
+	fmt.Print("Password: ")
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		raw, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		return string(raw), err
+	}
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	fmt.Println()
+	return strings.TrimSpace(line), nil
 }
 
 // readNewPassword asks for a password on the terminal, or generates one if left empty.
