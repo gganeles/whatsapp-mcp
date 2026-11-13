@@ -182,15 +182,69 @@ func (a *AuthServer) cleanupLoop() {
 
 // Register mounts the OAuth endpoints on mux.
 func (a *AuthServer) Register(mux *http.ServeMux) {
-	mux.HandleFunc("GET /.well-known/oauth-protected-resource", a.protectedResourceMetadata)
-	mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", a.protectedResourceMetadata)
-	mux.HandleFunc("GET /.well-known/oauth-authorization-server", a.authServerMetadata)
-	mux.HandleFunc("GET /.well-known/openid-configuration", a.authServerMetadata)
-	mux.HandleFunc("POST /register", a.register)
-	mux.HandleFunc("GET /authorize", a.authorizePage)
-	mux.HandleFunc("POST /authorize", a.authorizeSubmit)
-	mux.HandleFunc("POST /token", a.token)
-	mux.HandleFunc("POST /revoke", a.revoke)
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource", a.logged(a.protectedResourceMetadata))
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", a.logged(a.protectedResourceMetadata))
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", a.logged(a.authServerMetadata))
+	mux.HandleFunc("GET /.well-known/openid-configuration", a.logged(a.authServerMetadata))
+	mux.HandleFunc("POST /register", a.logged(a.register))
+	mux.HandleFunc("GET /authorize", a.logged(a.authorizePage))
+	mux.HandleFunc("POST /authorize", a.logged(a.authorizeSubmit))
+	mux.HandleFunc("POST /token", a.logged(a.token))
+	mux.HandleFunc("POST /revoke", a.logged(a.revoke))
+}
+
+// logged records each OAuth request with its outcome, so a client that "couldn't connect"
+// can be traced: which step it reached, what the server answered, and for a redirect back
+// to the client, the OAuth error it carried. Secrets (codes, tokens, passwords) aren't logged.
+func (a *AuthServer) logged(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		h(rec, r)
+		msg := fmt.Sprintf("OAuth %s %s -> %d", r.Method, r.URL.Path, rec.status)
+		if r.Method == http.MethodGet && r.URL.Path == "/authorize" {
+			q := r.URL.Query()
+			msg += fmt.Sprintf(" (redirect_uri=%q resource=%q)", q.Get("redirect_uri"), q.Get("resource"))
+		}
+		if loc := rec.Header().Get("Location"); loc != "" {
+			if u, err := url.Parse(loc); err == nil {
+				if e := u.Query().Get("error"); e != "" {
+					msg += fmt.Sprintf(" redirecting with error=%s: %s", e, u.Query().Get("error_description"))
+				} else {
+					msg += " redirecting to " + u.Scheme + "://" + u.Host + u.Path
+				}
+			}
+		}
+		if len(rec.body) > 0 && r.URL.Path != "/authorize" {
+			msg += ": " + strings.TrimSpace(string(rec.body))
+		}
+		if rec.status >= 400 || strings.Contains(msg, "error=") {
+			a.warnf("%s", msg)
+		} else {
+			a.infof("%s", msg)
+		}
+	}
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+	body   []byte // the start of an error response, for the log
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if !s.wrote {
+		s.status, s.wrote = code, true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	s.wrote = true
+	if s.status >= 400 && len(s.body) < 300 {
+		s.body = append(s.body, b[:min(len(b), 300-len(s.body))]...)
+	}
+	return s.ResponseWriter.Write(b)
 }
 
 type accountKey struct{}
