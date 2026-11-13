@@ -868,6 +868,9 @@ strong { color: var(--fg); }
 label { display: block; font-weight: 600; margin-bottom: 6px; }
 input[type=password], input[type=tel] { width: 100%; padding: 12px; margin-bottom: 14px; font: inherit; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: inherit; }
 .row { display: flex; gap: 10px; margin-top: 18px; }
+/* Allow comes first in the markup because pressing Enter in a field submits with the
+   form's first button; row-reverse still shows Deny on the left. */
+.actions { flex-direction: row-reverse; }
 button { flex: 1; padding: 12px; font: inherit; font-weight: 600; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .error { color: var(--err); margin: 12px 0 0; }
@@ -883,7 +886,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 <label for="password">Password</label>
 <input type="password" id="password" name="password" autocomplete="current-password">
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-<div class="row"><button type="submit" name="action" value="deny">Deny</button><button class="primary" type="submit" name="action" value="allow">Allow</button></div>
+<div class="row actions"><button class="primary" type="submit" name="action" value="allow">Allow</button><button type="submit" name="action" value="deny">Deny</button></div>
 </form>
 {{else}}<p>{{.Message}}</p>{{end}}
 </main></body></html>`))
