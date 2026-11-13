@@ -38,7 +38,7 @@ type AuthServer struct {
 	redirects RedirectPolicy
 	limiter   *loginLimiter
 
-	// Log receives token endpoint failures. Nil means don't log.
+	// Log receives sign-in and token endpoint events. Nil means don't log.
 	Log waLog.Logger
 
 	mu      sync.Mutex
@@ -182,15 +182,69 @@ func (a *AuthServer) cleanupLoop() {
 
 // Register mounts the OAuth endpoints on mux.
 func (a *AuthServer) Register(mux *http.ServeMux) {
-	mux.HandleFunc("GET /.well-known/oauth-protected-resource", a.protectedResourceMetadata)
-	mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", a.protectedResourceMetadata)
-	mux.HandleFunc("GET /.well-known/oauth-authorization-server", a.authServerMetadata)
-	mux.HandleFunc("GET /.well-known/openid-configuration", a.authServerMetadata)
-	mux.HandleFunc("POST /register", a.register)
-	mux.HandleFunc("GET /authorize", a.authorizePage)
-	mux.HandleFunc("POST /authorize", a.authorizeSubmit)
-	mux.HandleFunc("POST /token", a.token)
-	mux.HandleFunc("POST /revoke", a.revoke)
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource", a.logged(a.protectedResourceMetadata))
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", a.logged(a.protectedResourceMetadata))
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", a.logged(a.authServerMetadata))
+	mux.HandleFunc("GET /.well-known/openid-configuration", a.logged(a.authServerMetadata))
+	mux.HandleFunc("POST /register", a.logged(a.register))
+	mux.HandleFunc("GET /authorize", a.logged(a.authorizePage))
+	mux.HandleFunc("POST /authorize", a.logged(a.authorizeSubmit))
+	mux.HandleFunc("POST /token", a.logged(a.token))
+	mux.HandleFunc("POST /revoke", a.logged(a.revoke))
+}
+
+// logged records each OAuth request with its outcome, so a client that "couldn't connect"
+// can be traced: which step it reached, what the server answered, and for a redirect back
+// to the client, the OAuth error it carried. Secrets (codes, tokens, passwords) aren't logged.
+func (a *AuthServer) logged(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		h(rec, r)
+		msg := fmt.Sprintf("OAuth %s %s -> %d", r.Method, r.URL.Path, rec.status)
+		if r.Method == http.MethodGet && r.URL.Path == "/authorize" {
+			q := r.URL.Query()
+			msg += fmt.Sprintf(" (redirect_uri=%q resource=%q)", q.Get("redirect_uri"), q.Get("resource"))
+		}
+		if loc := rec.Header().Get("Location"); loc != "" {
+			if u, err := url.Parse(loc); err == nil {
+				if e := u.Query().Get("error"); e != "" {
+					msg += fmt.Sprintf(" redirecting with error=%s: %s", e, u.Query().Get("error_description"))
+				} else {
+					msg += " redirecting to " + u.Scheme + "://" + u.Host + u.Path
+				}
+			}
+		}
+		if len(rec.body) > 0 && r.URL.Path != "/authorize" {
+			msg += ": " + strings.TrimSpace(string(rec.body))
+		}
+		if rec.status >= 400 || strings.Contains(msg, "error=") {
+			a.warnf("%s", msg)
+		} else {
+			a.infof("%s", msg)
+		}
+	}
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+	body   []byte // the start of an error response, for the log
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if !s.wrote {
+		s.status, s.wrote = code, true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	s.wrote = true
+	if s.status >= 400 && len(s.body) < 300 {
+		s.body = append(s.body, b[:min(len(b), 300-len(s.body))]...)
+	}
+	return s.ResponseWriter.Write(b)
 }
 
 type accountKey struct{}
@@ -420,10 +474,12 @@ func (a *AuthServer) authorizeSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	account, err := NormalizePhone(r.PostForm.Get("phone"))
 	if err != nil {
+		a.warnf("Sign-in rejected: the phone number entered isn't in international format")
 		a.renderConsent(w, r, http.StatusBadRequest, id, p, "Enter your WhatsApp number in international format, e.g. +14155551234.")
 		return
 	}
 	if wait := a.limiter.blockedFor(account); wait > 0 {
+		a.warnf("Sign-in rejected for +%s: locked out for %s after too many failures", account, wait.Round(time.Second))
 		a.renderConsent(w, r, http.StatusTooManyRequests, id, p,
 			fmt.Sprintf("Too many failed sign-ins. Try again in %d minutes.", int(wait.Minutes())+1))
 		return
@@ -433,6 +489,14 @@ func (a *AuthServer) authorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		hash = dummyHash
 	}
 	if bcrypt.CompareHashAndPassword(hash, []byte(r.PostForm.Get("password"))) != nil || err != nil {
+		switch {
+		case errors.Is(err, ErrNoAccount):
+			a.warnf("Sign-in failed for +%s: no account with that number (see `user list`)", account)
+		case err != nil:
+			a.warnf("Sign-in failed for +%s: couldn't read the account: %v", account, err)
+		default:
+			a.warnf("Sign-in failed for +%s: wrong password", account)
+		}
 		a.limiter.fail(account)
 		a.renderConsent(w, r, http.StatusUnauthorized, id, p, "Wrong phone number or password.")
 		return
@@ -444,9 +508,11 @@ func (a *AuthServer) authorizeSubmit(w http.ResponseWriter, r *http.Request) {
 	if _, err := a.db.ExecContext(r.Context(), `INSERT INTO oauth_codes (code_hash, account_id, client_id, redirect_uri, code_challenge, scope, resource, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, hashSecret(code), account, p.clientID, p.redirectURI, p.challenge, p.scope, p.resource,
 		time.Now().Add(authCodeTTL).Unix()); err != nil {
+		a.warnf("Sign-in for +%s couldn't be completed: %v", account, err)
 		renderMessage(w, http.StatusInternalServerError, "Server error", "Couldn't complete sign-in.")
 		return
 	}
+	a.infof("Signed in +%s; sending the client back to %s", account, p.redirectURI)
 	redirectWithParams(w, r, p.redirectURI, url.Values{"code": {code}, "state": {p.state}, "iss": {a.base.String()}})
 }
 
@@ -482,21 +548,26 @@ func (a *AuthServer) exchangeCode(w http.ResponseWriter, r *http.Request, f url.
 		RETURNING account_id, client_id, redirect_uri, code_challenge, scope, resource, expires_at`, hashSecret(f.Get("code"))).
 		Scan(&account, &clientID, &redirectURI, &challenge, &scope, &resource, &expires)
 	if err != nil || time.Now().Unix() > expires {
+		a.warnf("Code exchange rejected: invalid or expired authorization code")
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired authorization code")
 		return
 	}
 	if f.Get("client_id") != clientID || f.Get("redirect_uri") != redirectURI {
+		a.warnf("Code exchange rejected for +%s: client_id or redirect_uri doesn't match the sign-in", account)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "client_id or redirect_uri doesn't match the authorization request")
 		return
 	}
 	if res := f.Get("resource"); res != "" && !a.validResource(res) {
+		a.warnf("Code exchange rejected for +%s: unknown resource %q (expected %s)", account, res, a.ResourceURL())
 		oauthError(w, http.StatusBadRequest, "invalid_target", "unknown resource")
 		return
 	}
 	if !verifyPKCE(f.Get("code_verifier"), challenge) {
+		a.warnf("Code exchange rejected for +%s: PKCE verification failed", account)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "PKCE verification failed")
 		return
 	}
+	a.infof("Issued tokens to +%s", account)
 	a.issueTokens(w, r, account, clientID, scope, resource)
 }
 
@@ -587,6 +658,12 @@ func insertTokenPair(tx *sql.Tx, now time.Time, account, clientID, scope, resour
 func temporaryError(w http.ResponseWriter) {
 	w.Header().Set("Retry-After", "5")
 	oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "the server couldn't handle the request, try again")
+}
+
+func (a *AuthServer) infof(format string, args ...any) {
+	if a.Log != nil {
+		a.Log.Infof(format, args...)
+	}
 }
 
 func (a *AuthServer) warnf(format string, args ...any) {
@@ -791,6 +868,9 @@ strong { color: var(--fg); }
 label { display: block; font-weight: 600; margin-bottom: 6px; }
 input[type=password], input[type=tel] { width: 100%; padding: 12px; margin-bottom: 14px; font: inherit; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: inherit; }
 .row { display: flex; gap: 10px; margin-top: 18px; }
+/* Allow comes first in the markup because pressing Enter in a field submits with the
+   form's first button; row-reverse still shows Deny on the left. */
+.actions { flex-direction: row-reverse; }
 button { flex: 1; padding: 12px; font: inherit; font-weight: 600; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .error { color: var(--err); margin: 12px 0 0; }
@@ -806,7 +886,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 <label for="password">Password</label>
 <input type="password" id="password" name="password" autocomplete="current-password">
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-<div class="row"><button type="submit" name="action" value="deny">Deny</button><button class="primary" type="submit" name="action" value="allow">Allow</button></div>
+<div class="row actions"><button class="primary" type="submit" name="action" value="allow">Allow</button><button type="submit" name="action" value="deny">Deny</button></div>
 </form>
 {{else}}<p>{{.Message}}</p>{{end}}
 </main></body></html>`))

@@ -132,6 +132,10 @@ func (ot *oauthTest) authorizeAs(phone, clientID, redirect, challenge, password 
 	if m == nil {
 		ot.t.Fatalf("no request id in consent page:\n%s", page)
 	}
+	// Pressing Enter in a field submits with the form's first button, so it must be Allow.
+	if allow, deny := strings.Index(page, `value="allow"`), strings.Index(page, `value="deny"`); allow < 0 || deny < 0 || allow > deny {
+		ot.t.Fatalf("the consent form's first button must be Allow:\n%s", page)
+	}
 	resp, _ = ot.postForm("/authorize", url.Values{"request": {m[1]}, "phone": {phone}, "password": {password}, "action": {"allow"}})
 	return resp
 }
