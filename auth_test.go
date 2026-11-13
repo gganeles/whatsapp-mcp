@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -208,14 +209,47 @@ func TestOAuthFlow(t *testing.T) {
 		t.Fatalf("refresh token accepted as access token: %d", resp.StatusCode)
 	}
 
-	// Refresh tokens rotate.
+	// Refresh tokens rotate, but the old one keeps working for a short grace period, so a lost
+	// token response or two refreshes racing don't sign the client out.
 	refreshForm := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh}, "client_id": {clientID}}
 	resp, body = ot.postForm("/token", refreshForm)
 	if resp.StatusCode != 200 {
 		t.Fatalf("refresh failed: %d %s", resp.StatusCode, body)
 	}
+	var rotated map[string]any
+	_ = json.Unmarshal([]byte(body), &rotated)
+	newRefresh, _ := rotated["refresh_token"].(string)
+	if newRefresh == "" || newRefresh == refresh {
+		t.Fatalf("refresh didn't rotate the refresh token: %s", body)
+	}
+	if resp, body := ot.postForm("/token", refreshForm); resp.StatusCode != 200 {
+		t.Fatalf("refresh token reuse within the grace period rejected: %d %s", resp.StatusCode, body)
+	}
+
+	// Reusing the old token doesn't extend its grace period, and once that ends it's rejected.
+	var expires int64
+	if err := ot.auth.db.QueryRow(`SELECT expires_at FROM oauth_tokens WHERE token_hash = ?`, hashSecret(refresh)).Scan(&expires); err != nil {
+		t.Fatal(err)
+	}
+	if limit := time.Now().Add(refreshReuseGrace).Unix(); expires > limit {
+		t.Fatalf("rotated refresh token expires at %d, after the grace period ends at %d", expires, limit)
+	}
+	if _, err := ot.auth.db.Exec(`UPDATE oauth_tokens SET expires_at = ? WHERE token_hash = ?`,
+		time.Now().Add(-time.Second).Unix(), hashSecret(refresh)); err != nil {
+		t.Fatal(err)
+	}
 	if resp, _ := ot.postForm("/token", refreshForm); resp.StatusCode != 400 {
-		t.Fatalf("refresh token reuse accepted: %d", resp.StatusCode)
+		t.Fatalf("refresh token reuse after the grace period accepted: %d", resp.StatusCode)
+	}
+	newForm := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {newRefresh}, "client_id": {clientID}}
+	if resp, body := ot.postForm("/token", newForm); resp.StatusCode != 200 {
+		t.Fatalf("rotated refresh token rejected: %d %s", resp.StatusCode, body)
+	}
+
+	// A refresh token can't be used by another client.
+	otherForm := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {newRefresh}, "client_id": {"someone-else"}}
+	if resp, _ := ot.postForm("/token", otherForm); resp.StatusCode != 400 {
+		t.Fatalf("refresh token accepted from another client: %d", resp.StatusCode)
 	}
 
 	// Revoking everything signs the client out.
@@ -224,6 +258,24 @@ func TestOAuthFlow(t *testing.T) {
 	}
 	if resp, _ := mcpPost(access); resp.StatusCode != 401 {
 		t.Fatalf("revoked token still works: %d", resp.StatusCode)
+	}
+}
+
+// A server-side failure must not look like a bad token: clients drop their tokens on
+// invalid_grant or 401, which forces the user to reconnect by hand.
+func TestOAuthServerErrorsAreTemporary(t *testing.T) {
+	ot := newOAuthTest(t)
+	access := ot.signIn(testPhone, testPassword)
+	if err := ot.auth.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resp, body := ot.postForm("/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"anything"}})
+	if resp.StatusCode != http.StatusServiceUnavailable || strings.Contains(body, "invalid_grant") {
+		t.Fatalf("refresh with a broken database: want 503, got %d %s", resp.StatusCode, body)
+	}
+	resp, _ = ot.do("POST", "/mcp", strings.NewReader(`{}`), "application/json", "Authorization", "Bearer "+access)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("MCP call with a broken database: want 503, got %d", resp.StatusCode)
 	}
 }
 
