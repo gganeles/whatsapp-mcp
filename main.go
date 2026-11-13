@@ -258,6 +258,7 @@ func runServeHTTP(ctx context.Context, cfg config, log waLog.Logger) error {
 	if err != nil {
 		return err
 	}
+	auth.Log = log.Sub("OAuth")
 
 	accounts := NewAccountManager(cfg.dataDir, store, log)
 	defer accounts.Close()

@@ -214,7 +214,9 @@ number, or a chat name that matches exactly one chat.
 - **OAuth 2.1 with PKCE.** Clients register dynamically and must be approved on a consent page with
   an account's phone number and password (bcrypt). Only SHA-256 hashes of codes and tokens are
   stored. Access tokens last an hour; refresh tokens rotate on every use and expire after 90 days
-  of disuse.
+  of disuse. A rotated refresh token keeps working for two more minutes, so a token response lost
+  in transit or two refreshes racing don't force you to reconnect the connector. Server-side
+  failures answer `503` rather than `invalid_grant` or `401`, so clients retry instead of signing out.
 - **Redirect allowlist.** Only Claude's callback URLs and loopback addresses (for local apps) can
   register, so a stranger can't set up a client that sends codes to their own site. Add more with
   `--allow-redirect`.

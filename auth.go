@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	waLog "go.mau.fi/whatsmeow/util/log"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -37,6 +38,9 @@ type AuthServer struct {
 	redirects RedirectPolicy
 	limiter   *loginLimiter
 
+	// Log receives token endpoint failures. Nil means don't log.
+	Log waLog.Logger
+
 	mu      sync.Mutex
 	pending map[string]*pendingAuth // consent pages that haven't been submitted yet
 }
@@ -49,6 +53,12 @@ const (
 	consentTTL       = 10 * time.Minute
 	maxClients       = 200
 	minPasswordChars = 12
+
+	// refreshReuseGrace is how long a refresh token keeps working after it has been rotated.
+	// Without it, a token response lost on the way back (a tunnel blip, a client timeout) or
+	// two refreshes racing with the same token would leave the client with no valid token,
+	// and the user would have to reconnect the connector by hand.
+	refreshReuseGrace = 2 * time.Minute
 )
 
 const authSchema = `
@@ -198,7 +208,15 @@ func (a *AuthServer) Protect(next http.Handler) http.Handler {
 		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		account := ""
 		if ok && token != "" {
-			account = a.accessTokenAccount(r.Context(), token)
+			var err error
+			if account, err = a.accessTokenAccount(r.Context(), token); err != nil {
+				// A database problem doesn't mean the token is bad. Answering 401 would make the
+				// client refresh or drop its tokens, so ask it to retry instead.
+				a.warnf("Couldn't check an access token: %v", err)
+				w.Header().Set("Retry-After", "5")
+				http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+				return
+			}
 		}
 		if account == "" {
 			challenge := fmt.Sprintf(`Bearer resource_metadata="%s", scope="%s"`, a.url("/.well-known/oauth-protected-resource/mcp"), scopeAll)
@@ -213,17 +231,24 @@ func (a *AuthServer) Protect(next http.Handler) http.Handler {
 	})
 }
 
-// accessTokenAccount returns the account a valid access token belongs to, or "".
-func (a *AuthServer) accessTokenAccount(ctx context.Context, token string) string {
+// accessTokenAccount returns the account a valid access token belongs to, or "" if the token
+// is unknown, expired or for another resource. An error means the token couldn't be checked.
+func (a *AuthServer) accessTokenAccount(ctx context.Context, token string) (string, error) {
 	var expires int64
 	var resource, account string
 	err := a.db.QueryRowContext(ctx, `SELECT t.expires_at, t.resource, t.account_id FROM oauth_tokens t
 		JOIN accounts a ON a.id = t.account_id WHERE t.token_hash = ? AND t.kind = 'access'`,
 		hashSecret(token)).Scan(&expires, &resource, &account)
-	if err != nil || time.Now().Unix() >= expires || resource != a.ResourceURL() {
-		return ""
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
 	}
-	return account
+	if err != nil {
+		return "", err
+	}
+	if time.Now().Unix() >= expires || resource != a.ResourceURL() {
+		return "", nil
+	}
+	return account, nil
 }
 
 func (a *AuthServer) protectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
@@ -475,40 +500,102 @@ func (a *AuthServer) exchangeCode(w http.ResponseWriter, r *http.Request, f url.
 	a.issueTokens(w, r, account, clientID, scope, resource)
 }
 
+var (
+	errUnknownRefreshToken = errors.New("invalid or expired refresh token")
+	errWrongClient         = errors.New("refresh token was issued to another client")
+)
+
+// refresh rotates a refresh token. The presented token isn't deleted: it stays valid for
+// refreshReuseGrace, so a client whose token response got lost, or that refreshed twice at
+// once, can still recover. Using it again never extends that window. Checking the old token,
+// shortening it and issuing the new pair happen in one transaction, so a failure part way
+// leaves the old token as it was.
 func (a *AuthServer) refresh(w http.ResponseWriter, r *http.Request, f url.Values) {
-	ctx := r.Context()
-	var account, clientID, scope, resource string
-	var expires int64
-	// Refresh tokens rotate: the presented one is consumed and a new one issued.
-	err := a.db.QueryRowContext(ctx, `DELETE FROM oauth_tokens WHERE token_hash = ? AND kind = 'refresh'
-		RETURNING account_id, client_id, scope, resource, expires_at`, hashSecret(f.Get("refresh_token"))).
-		Scan(&account, &clientID, &scope, &resource, &expires)
-	if err != nil || time.Now().Unix() > expires {
-		oauthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired refresh token")
-		return
+	presented := hashSecret(f.Get("refresh_token"))
+	var access, refresh, scope string
+	var reused bool
+	err := withTx(r.Context(), a.db, func(tx *sql.Tx) error {
+		now := time.Now()
+		var account, clientID, resource string
+		var expires int64
+		err := tx.QueryRow(`SELECT account_id, client_id, scope, resource, expires_at FROM oauth_tokens
+			WHERE token_hash = ? AND kind = 'refresh'`, presented).Scan(&account, &clientID, &scope, &resource, &expires)
+		if errors.Is(err, sql.ErrNoRows) {
+			return errUnknownRefreshToken
+		}
+		if err != nil {
+			return err
+		}
+		if now.Unix() > expires {
+			return errUnknownRefreshToken
+		}
+		if id := f.Get("client_id"); id != "" && id != clientID {
+			return errWrongClient
+		}
+		graceEnd := now.Add(refreshReuseGrace).Unix()
+		reused = expires <= graceEnd
+		if _, err = tx.Exec(`UPDATE oauth_tokens SET expires_at = MIN(expires_at, ?) WHERE token_hash = ?`, graceEnd, presented); err != nil {
+			return err
+		}
+		access, refresh, err = insertTokenPair(tx, now, account, clientID, scope, resource)
+		return err
+	})
+	switch {
+	case errors.Is(err, errUnknownRefreshToken), errors.Is(err, errWrongClient):
+		a.warnf("Refresh rejected: %v", err)
+		oauthError(w, http.StatusBadRequest, "invalid_grant", err.Error())
+	case err != nil:
+		a.warnf("Refresh failed: %v", err)
+		temporaryError(w)
+	default:
+		if reused {
+			a.warnf("Refresh token reused within its grace period (a lost response or concurrent refreshes)")
+		}
+		writeTokens(w, access, refresh, scope)
 	}
-	if id := f.Get("client_id"); id != "" && id != clientID {
-		oauthError(w, http.StatusBadRequest, "invalid_grant", "refresh token was issued to another client")
-		return
-	}
-	a.issueTokens(w, r, account, clientID, scope, resource)
 }
 
 func (a *AuthServer) issueTokens(w http.ResponseWriter, r *http.Request, account, clientID, scope, resource string) {
-	access, refresh := randomToken(32), randomToken(32)
-	now := time.Now()
-	err := withTx(r.Context(), a.db, func(tx *sql.Tx) error {
-		const q = `INSERT INTO oauth_tokens (token_hash, account_id, kind, client_id, scope, resource, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
-		if _, err := tx.Exec(q, hashSecret(access), account, "access", clientID, scope, resource, now.Add(accessTokenTTL).Unix()); err != nil {
-			return err
-		}
-		_, err := tx.Exec(q, hashSecret(refresh), account, "refresh", clientID, scope, resource, now.Add(refreshTokenTTL).Unix())
+	var access, refresh string
+	err := withTx(r.Context(), a.db, func(tx *sql.Tx) (err error) {
+		access, refresh, err = insertTokenPair(tx, time.Now(), account, clientID, scope, resource)
 		return err
 	})
 	if err != nil {
-		oauthError(w, http.StatusInternalServerError, "server_error", "failed to issue tokens")
+		a.warnf("Issuing tokens failed: %v", err)
+		temporaryError(w)
 		return
 	}
+	writeTokens(w, access, refresh, scope)
+}
+
+// insertTokenPair stores a new access token and refresh token and returns them.
+func insertTokenPair(tx *sql.Tx, now time.Time, account, clientID, scope, resource string) (access, refresh string, err error) {
+	access, refresh = randomToken(32), randomToken(32)
+	const q = `INSERT INTO oauth_tokens (token_hash, account_id, kind, client_id, scope, resource, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+	if _, err = tx.Exec(q, hashSecret(access), account, "access", clientID, scope, resource, now.Add(accessTokenTTL).Unix()); err != nil {
+		return "", "", err
+	}
+	if _, err = tx.Exec(q, hashSecret(refresh), account, "refresh", clientID, scope, resource, now.Add(refreshTokenTTL).Unix()); err != nil {
+		return "", "", err
+	}
+	return access, refresh, nil
+}
+
+// temporaryError tells a client that the server couldn't handle the request right now. It
+// must not look like invalid_grant, which clients treat as "sign in again".
+func temporaryError(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "5")
+	oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "the server couldn't handle the request, try again")
+}
+
+func (a *AuthServer) warnf(format string, args ...any) {
+	if a.Log != nil {
+		a.Log.Warnf(format, args...)
+	}
+}
+
+func writeTokens(w http.ResponseWriter, access, refresh, scope string) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":  access,
 		"token_type":    "Bearer",
