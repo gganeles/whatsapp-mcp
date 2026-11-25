@@ -56,7 +56,9 @@ func bind(resolve ToolResolver, method func(*tools, context.Context, mcp.CallToo
 	}
 }
 
-func NewMCPServer(resolve ToolResolver, version string, readOnly bool) *server.MCPServer {
+// NewMCPServer builds the MCP server. uploads may be nil (stdio mode), in which case the
+// create_upload_link tool isn't offered.
+func NewMCPServer(resolve ToolResolver, version string, readOnly bool, uploads *UploadLinks) *server.MCPServer {
 	s := server.NewMCPServer("whatsapp", version,
 		server.WithToolCapabilities(false),
 		server.WithInstructions(instructions),
@@ -127,7 +129,7 @@ func NewMCPServer(resolve ToolResolver, version string, readOnly bool) *server.M
 	), bind(resolve, (*tools).searchContacts))
 
 	if !readOnly {
-		addSendTools(s, resolve)
+		addSendTools(s, resolve, uploads)
 	}
 
 	s.AddTool(mcp.NewTool("download_media",
@@ -147,7 +149,7 @@ func NewMCPServer(resolve ToolResolver, version string, readOnly bool) *server.M
 	return s
 }
 
-func addSendTools(s *server.MCPServer, resolve ToolResolver) {
+func addSendTools(s *server.MCPServer, resolve ToolResolver, uploads *UploadLinks) {
 	s.AddTool(mcp.NewTool("send_message",
 		mcp.WithDescription("Send a text message. Confirm the recipient and text with the user first."),
 		mcp.WithString("to", mcp.Required(), mcp.Description("Recipient: chat JID, phone number in international format, or exact chat name.")),
@@ -158,16 +160,43 @@ func addSendTools(s *server.MCPServer, resolve ToolResolver) {
 	), bind(resolve, (*tools).sendMessage))
 
 	s.AddTool(mcp.NewTool("send_file",
-		mcp.WithDescription("Send a file as an image, video, audio, voice note, or document. Give either content_base64 with file_name, or a path inside the server's files folder (e.g. a file saved by download_media). Confirm with the user first."),
+		mcp.WithDescription("Send any file: a PDF or other document, an image, video, audio, or voice note. Give exactly one source: "+
+			"path (a file in the server's files folder, e.g. one saved by download_media or uploaded through create_upload_link), "+
+			"url (a public http(s) link the server downloads), or content_base64 with file_name (only for small files). "+
+			"Files that WhatsApp can't show inline (PDF, Word, Excel, zip, etc.) are sent as documents with their file name. Confirm with the user first."),
 		mcp.WithString("to", mcp.Required(), mcp.Description("Recipient: chat JID, phone number in international format, or exact chat name.")),
-		mcp.WithString("content_base64", mcp.Description("The file's bytes, base64-encoded (max 32 MB).")),
-		mcp.WithString("file_name", mcp.Description("File name, including extension, for content_base64.")),
 		mcp.WithString("path", mcp.Description("Path of a file inside the server's files folder, relative to it.")),
+		mcp.WithString("url", mcp.Description("Public http(s) URL of the file to download and send (max 100 MB).")),
+		mcp.WithString("content_base64", mcp.Description("The file's bytes, base64-encoded (max 32 MB). Prefer path or url for anything but small files.")),
+		mcp.WithString("file_name", mcp.Description("File name, including extension. Required with content_base64; otherwise overrides the name shown on a document.")),
 		mcp.WithString("caption", mcp.Description("Optional caption (not shown for audio).")),
-		mcp.WithString("as", mcp.Description("How to send it. auto picks from the file type."), mcp.Enum("auto", "image", "video", "audio", "voice_note", "document")),
+		mcp.WithString("as", mcp.Description("How to send it. auto picks from the file type and sends anything WhatsApp can't play or show inline as a document."), mcp.Enum("auto", "image", "video", "audio", "voice_note", "document")),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(true),
 	), bind(resolve, (*tools).sendFile))
+
+	if uploads != nil {
+		s.AddTool(mcp.NewTool("create_upload_link",
+			mcp.WithDescription("Get a single-use URL to upload a file (any type, up to 100 MB) into the server's files folder, so it can be sent with send_file. "+
+				"Use it when the file is on your own machine or sandbox: upload with `curl -T <local file> <upload_url>`, then call send_file with the returned path. "+
+				"The link expires after 30 minutes."),
+			mcp.WithString("file_name", mcp.Required(), mcp.Description("The file's name, including extension (e.g. report.pdf). Recipients see it on documents.")),
+			mcp.WithDestructiveHintAnnotation(false),
+		), bind(resolve, func(t *tools, ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			name := req.GetString("file_name", "")
+			if strings.TrimSpace(name) == "" {
+				return errResult(errors.New("file_name is required"))
+			}
+			link, path, expires, err := uploads.Create(t.filesDir, name)
+			if err != nil {
+				return errResult(err)
+			}
+			return jsonResult(map[string]any{
+				"upload_url": link, "path": path, "expires_at": expires.UTC().Format(time.RFC3339),
+				"how": "curl -sS -T '<local file>' '" + link + "'   (or: curl -sS -F file=@'<local file>' '" + link + "'), then call send_file with path \"" + path + "\".",
+			})
+		}))
+	}
 
 	s.AddTool(mcp.NewTool("send_reaction",
 		mcp.WithDescription("React to a message with an emoji, or remove your reaction with an empty emoji."),
@@ -650,29 +679,32 @@ func (t *tools) sendFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if err != nil {
 		return errResult(err)
 	}
-	data, path, err := t.fileInput(req)
+	var (
+		data     []byte
+		name     string
+		typeHint string
+	)
+	if u := req.GetString("url", ""); u != "" {
+		if req.GetString("path", "") != "" || req.GetString("content_base64", "") != "" {
+			return errResult(errors.New("give only one of path, url, or content_base64"))
+		}
+		data, name, typeHint, err = fetchURL(ctx, u)
+	} else {
+		data, name, err = t.fileInput(req)
+	}
 	if err != nil {
 		return errResult(err)
 	}
-	mimeType := mime.TypeByExtension(strings.ToLower(filepath.Ext(path)))
-	if mimeType == "" {
-		mimeType = http.DetectContentType(data)
+	if n := req.GetString("file_name", ""); n != "" {
+		name = sanitizeFileName(n)
 	}
-	if i := strings.Index(mimeType, ";"); i > 0 && !strings.HasPrefix(mimeType, "audio/ogg") {
-		mimeType = mimeType[:i]
+	if len(data) == 0 {
+		return errResult(errors.New("the file is empty"))
 	}
+	mimeType := detectMimeType(name, data, typeHint)
 	kind := req.GetString("as", "auto")
 	if kind == "auto" || kind == "" {
-		switch {
-		case strings.HasPrefix(mimeType, "image/") && mimeType != "image/svg+xml" && mimeType != "image/gif":
-			kind = "image"
-		case strings.HasPrefix(mimeType, "video/"):
-			kind = "video"
-		case strings.HasPrefix(mimeType, "audio/"):
-			kind = "audio"
-		default:
-			kind = "document"
-		}
+		kind = autoKind(mimeType)
 	}
 	caption := req.GetString("caption", "")
 
@@ -702,8 +734,8 @@ func (t *tools) sendFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 			FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: &up.FileLength,
 		}
 	case "audio", "voice_note":
-		if kind == "voice_note" && mimeType != "audio/ogg; codecs=opus" {
-			// WhatsApp voice notes are Opus in an Ogg container.
+		if kind == "voice_note" || mimeType == "audio/ogg" {
+			// WhatsApp voice notes and Ogg audio are Opus in an Ogg container.
 			mimeType = "audio/ogg; codecs=opus"
 		}
 		msg.AudioMessage = &waE2E.AudioMessage{
@@ -714,7 +746,7 @@ func (t *tools) sendFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	case "document":
 		msg.DocumentMessage = &waE2E.DocumentMessage{
 			Caption: optString(caption), Mimetype: proto.String(mimeType),
-			FileName: proto.String(path), Title: proto.String(path),
+			FileName: proto.String(name), Title: proto.String(name),
 			URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
 			FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: &up.FileLength,
 		}
@@ -930,4 +962,85 @@ func formatMessages(msgs []Message, includeChat bool) string {
 		b.WriteString("}\n")
 	}
 	return b.String()
+}
+
+// extraMimeTypes covers common document types that Go's built-in table lacks and that
+// minimal systems (containers, Termux) often have no /etc/mime.types for.
+var extraMimeTypes = map[string]string{
+	".pdf":  "application/pdf",
+	".doc":  "application/msword",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xls":  "application/vnd.ms-excel",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".ppt":  "application/vnd.ms-powerpoint",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".odt":  "application/vnd.oasis.opendocument.text",
+	".ods":  "application/vnd.oasis.opendocument.spreadsheet",
+	".odp":  "application/vnd.oasis.opendocument.presentation",
+	".rtf":  "application/rtf",
+	".txt":  "text/plain",
+	".csv":  "text/csv",
+	".md":   "text/markdown",
+	".zip":  "application/zip",
+	".rar":  "application/vnd.rar",
+	".7z":   "application/x-7z-compressed",
+	".tar":  "application/x-tar",
+	".gz":   "application/gzip",
+	".apk":  "application/vnd.android.package-archive",
+	".epub": "application/epub+zip",
+	".ics":  "text/calendar",
+	".vcf":  "text/vcard",
+	".mp4":  "video/mp4",
+	".m4v":  "video/mp4",
+	".3gp":  "video/3gpp",
+	".mov":  "video/quicktime",
+	".mkv":  "video/x-matroska",
+	".webm": "video/webm",
+	".avi":  "video/x-msvideo",
+	".mp3":  "audio/mpeg",
+	".m4a":  "audio/mp4",
+	".aac":  "audio/aac",
+	".amr":  "audio/amr",
+	".ogg":  "audio/ogg",
+	".opus": "audio/ogg",
+	".wav":  "audio/wav",
+	".flac": "audio/flac",
+	".heic": "image/heic",
+}
+
+// detectMimeType picks the file's MIME type from its extension, then a server-supplied
+// hint (from a URL download), then its content.
+func detectMimeType(name string, data []byte, hint string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	mt := extraMimeTypes[ext]
+	if mt == "" && ext != "" {
+		mt = mime.TypeByExtension(ext)
+	}
+	if mt == "" || mt == "application/octet-stream" {
+		if h, _, err := mime.ParseMediaType(hint); err == nil && h != "application/octet-stream" && h != "" {
+			mt = h
+		}
+	}
+	if mt == "" {
+		mt = http.DetectContentType(data)
+	}
+	if i := strings.Index(mt, ";"); i > 0 {
+		mt = strings.TrimSpace(mt[:i])
+	}
+	return mt
+}
+
+// autoKind decides how to send a file. Only formats WhatsApp shows or plays inline go as
+// image, video or audio messages; everything else (PDFs, office files, archives, GIFs,
+// MKV, WAV, ...) goes as a document so it arrives intact with its file name.
+func autoKind(mimeType string) string {
+	switch mimeType {
+	case "image/jpeg", "image/png", "image/webp":
+		return "image"
+	case "video/mp4", "video/3gpp":
+		return "video"
+	case "audio/mpeg", "audio/mp4", "audio/aac", "audio/amr", "audio/ogg":
+		return "audio"
+	}
+	return "document"
 }

@@ -201,7 +201,8 @@ In Docker, prefix them with `docker compose run --rm whatsapp-mcp`.
 | `get_message_context` | Messages around a given message, such as a search hit |
 | `search_contacts` | Find a contact or group by name or number |
 | `send_message` | Send text, optionally as a quote-reply |
-| `send_file` | Send an image, video, audio, voice note, or document |
+| `send_file` | Send any file (PDF, Word, Excel, zip, ...) as a document, or an image, video, audio, or voice note |
+| `create_upload_link` | Get a single-use URL to upload a local file for `send_file` (HTTP mode) |
 | `send_reaction` | React to a message with an emoji |
 | `download_media` | Get a message's attachment (images inline, documents as a file) |
 | `request_history` | Ask the phone for older messages in a chat |
@@ -225,8 +226,11 @@ number, or a chat name that matches exactly one chat.
   wrong passwords get the same answer in the same time, so the page doesn't reveal who has an account.
 - **Hardened HTTP.** Unknown `Host` headers are rejected, request sizes and header timeouts are
   capped, and pages send a strict CSP, `frame-ancestors 'none'`, and HSTS.
-- **File sandbox.** `send_file` only reads from the account's files folder or takes the file's bytes
-  directly; it can't reach session databases, other accounts, or anything else on the server.
+- **File sandbox.** `send_file` only reads from the account's files folder, takes the file's bytes
+  directly, or downloads a public URL (loopback, private, and link-local addresses are refused); it
+  can't reach session databases, other accounts, or anything else on the server.
+- **Upload links.** `create_upload_link` returns an unguessable `/upload/<token>` URL that accepts one
+  file (up to 100 MB) within 30 minutes and writes it to the account's `files/uploads/` folder.
 - **Prompt-injection guidance.** The server tells the model that message contents are untrusted and
   that it must not send anything because a message asks it to.
 - **Read-only mode.** `--read-only` (or `WHATSAPP_MCP_READ_ONLY=true`) removes every sending tool.

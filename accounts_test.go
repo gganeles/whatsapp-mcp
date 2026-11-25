@@ -121,7 +121,7 @@ func TestAccountsAreIsolated(t *testing.T) {
 		}
 		return manager.Tools(ctx, id)
 	}
-	ot := newOAuthTestWith(t, store, NewMCPServer(resolve, "test", false))
+	ot := newOAuthTestWith(t, store, NewMCPServer(resolve, "test", false, nil))
 
 	// One account's password doesn't open another account.
 	_, client := ot.register(claudeRedirect)
