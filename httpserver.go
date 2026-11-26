@@ -13,8 +13,10 @@ import (
 )
 
 // NewHTTPHandler builds the HTTP handler: the MCP endpoint at /mcp (behind OAuth unless
-// auth is disabled), the OAuth endpoints, and a health check.
-func NewHTTPHandler(s *server.MCPServer, auth *AuthServer, publicURL string, extraHosts []string) http.Handler {
+// auth is disabled), the OAuth endpoints, a health check, and, when uploads is set, the
+// single-use file upload endpoint. Upload URLs carry their own unguessable token, so they
+// don't need OAuth (clients such as curl in a sandbox have no access token).
+func NewHTTPHandler(s *server.MCPServer, auth *AuthServer, uploads *UploadLinks, publicURL string, extraHosts []string) http.Handler {
 	mcpHandler := server.NewStreamableHTTPServer(s,
 		server.WithEndpointPath("/mcp"),
 		// Keep SSE streams alive through proxies such as Cloudflare, which drop idle connections after 100s.
@@ -34,6 +36,9 @@ func NewHTTPHandler(s *server.MCPServer, auth *AuthServer, publicURL string, ext
 		protected = auth.Protect(protected)
 	}
 	mux.Handle("/mcp", protected)
+	if uploads != nil {
+		mux.Handle("/upload/{token}", uploads)
+	}
 
 	allowedHosts := extraHosts
 	if u, err := url.Parse(publicURL); err == nil && u.Host != "" {

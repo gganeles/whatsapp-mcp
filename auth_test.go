@@ -58,7 +58,7 @@ func newOAuthTestWith(t *testing.T, store *AccountStore, s *server.MCPServer) *o
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler = NewHTTPHandler(s, ot.auth, ot.srv.URL, nil)
+	handler = NewHTTPHandler(s, ot.auth, nil, ot.srv.URL, nil)
 	ot.client = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	return ot
 }

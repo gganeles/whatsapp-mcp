@@ -60,3 +60,31 @@ func TestSanitizeFileName(t *testing.T) {
 		}
 	}
 }
+
+func TestDetectMimeAndKind(t *testing.T) {
+	cases := []struct {
+		name, hint, mime, kind string
+		data                   []byte
+	}{
+		{"report.pdf", "", "application/pdf", "document", []byte("%PDF-1.7")},
+		{"notes.docx", "", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "document", []byte("PK\x03\x04")},
+		{"sheet.xlsx", "", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "document", []byte("PK\x03\x04")},
+		{"archive.zip", "", "application/zip", "document", []byte("PK\x03\x04")},
+		{"readme.txt", "", "text/plain", "document", []byte("hello")},
+		{"photo.JPG", "", "image/jpeg", "image", []byte{0xff, 0xd8, 0xff}},
+		{"anim.gif", "", "image/gif", "document", []byte("GIF89a")},
+		{"clip.mp4", "", "video/mp4", "video", nil},
+		{"clip.mkv", "", "video/x-matroska", "document", nil},
+		{"song.mp3", "", "audio/mpeg", "audio", nil},
+		{"take.wav", "", "audio/wav", "document", nil},
+		{"voice.opus", "", "audio/ogg", "audio", nil},
+		{"download", "application/pdf; charset=binary", "application/pdf", "document", []byte("x")},
+		{"noext", "", "application/pdf", "document", []byte("%PDF-1.4\n")},
+	}
+	for _, c := range cases {
+		mt := detectMimeType(c.name, c.data, c.hint)
+		if mt != c.mime || autoKind(mt) != c.kind {
+			t.Errorf("%s: got %s/%s, want %s/%s", c.name, mt, autoKind(mt), c.mime, c.kind)
+		}
+	}
+}

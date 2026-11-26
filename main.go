@@ -233,7 +233,7 @@ func runServeStdio(ctx context.Context, cfg config, log waLog.Logger) error {
 	if !wa.LoggedIn() {
 		log.Warnf("WhatsApp isn't linked yet. Use the pair_device tool, or run `whatsapp-mcp login`.")
 	}
-	s := NewMCPServer(SingleAccount(wa), version, cfg.readOnly)
+	s := NewMCPServer(SingleAccount(wa), version, cfg.readOnly, nil)
 	errc := make(chan error, 1)
 	go func() { errc <- server.ServeStdio(s) }()
 	select {
@@ -276,10 +276,11 @@ func runServeHTTP(ctx context.Context, cfg config, log waLog.Logger) error {
 		}
 		return accounts.Tools(ctx, id)
 	}
-	s := NewMCPServer(resolve, version, cfg.readOnly)
+	uploads := NewUploadLinks(cfg.publicURL)
+	s := NewMCPServer(resolve, version, cfg.readOnly, uploads)
 	log.Infof("Connector URL: %s", auth.ResourceURL())
 	log.Infof("Listening on %s", cfg.httpAddr)
-	return ServeHTTP(ctx, cfg.httpAddr, NewHTTPHandler(s, auth, cfg.publicURL, cfg.allowedHosts))
+	return ServeHTTP(ctx, cfg.httpAddr, NewHTTPHandler(s, auth, uploads, cfg.publicURL, cfg.allowedHosts))
 }
 
 // runHealthcheck lets container runtimes probe the server without needing curl in the image.
